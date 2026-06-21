@@ -140,16 +140,4 @@ cmake --build build --target vkml
 cmake --build build --target clean
 ```
 
-## Troubleshooting
 
-- Missing CMake package: install the matching development package or set `CMAKE_PREFIX_PATH`.
-- Missing `shaders/*.spv`: build the project and run from the build directory.
-- Missing `../external/sponza/glTF/Sponza.gltf`: check the asset folder and run from the build directory.
-- Shader compiler error: check that `glslc` is installed and visible to CMake.
-
-## Extra Docs
-
-- Detailed shader and pipeline notes: `.docs/SHADER_AND_VULKAN_COMPONENTS.md`
-- Main renderer source: `src/demo/main.cpp`
-- Shader source: `shaders/`
-- Camera helper: `foundation/`
