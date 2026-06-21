@@ -35,7 +35,7 @@
 - [x] Final composition pass using `compose.frag`
 - [x] Swapchain present step
 
-## Scaffolded Or Not Wired Yet
+## Active work
 
 - [ ] SSAO blur math in `ssao_blur.comp`
 - [ ] Triangle filtering runtime pass using `filtering.comp`
@@ -44,7 +44,7 @@
 - [ ] Deferred lighting pass
 - [ ] Material texture sampling in the G-buffer shader
 
-## Ambitious Roadmap
+## Future Roadmap
 
 - [ ] Triangle filtering compute pass
 - [ ] GPU frustum culling pass
@@ -55,32 +55,20 @@
 - [ ] Runtime LOD selection
 - [ ] Particle system 
 - [ ] Particle collision against depth
-- [ ] GPU emitter buffers
 - [ ] Shadow map pass
 - [ ] Point light shadow cubemaps
 - [ ] Deferred lighting pass
 - [ ] Tiled or clustered lighting
 - [ ] PBR material shader
-- [ ] glTF base-color texture sampling
-- [ ] Normal map sampling
-- [ ] Metallic/roughness texture sampling
-- [ ] Emissive material pass
 - [ ] Alpha-tested material pass
 - [ ] Transparent material pass
-- [ ] Weighted blended transparency
 - [ ] Bilateral SSAO blur
-- [ ] SSAO settings for radius, strength, and bias
-- [ ] Bloom prefilter/downsample/upsample passes
-- [ ] HDR scene color target
-- [ ] Exposure control
-- [ ] Tone mapping pass
 - [ ] FXAA pass
 - [ ] Temporal anti-aliasing pass
 - [ ] Skybox pass
 - [ ] Image-based lighting
 - [ ] Screen-space reflections
 - [ ] Volumetric fog pass
-- [ ] Debug views for albedo, normals, depth, SSAO, and lighting
 - [ ] Render graph for pass ordering and resource tracking
 - [ ] Shader hot reload
 - [ ] ImGui debug panel
