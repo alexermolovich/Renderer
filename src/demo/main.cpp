@@ -64,6 +64,14 @@ VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3{
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
     .extendedDynamicState3ColorBlendEnable = VK_TRUE};
 
+VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddressFeature = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
+    .bufferDeviceAddress = VK_TRUE};
+
+VkPhysicalDeviceDescriptorIndexingFeatures descriptorIndexingFeature = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+    .shaderSampledImageArrayNonUniformIndexing = VK_TRUE};
+
 VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamicRenderingFeature = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
     .pNext = &eds3,
@@ -81,6 +89,11 @@ VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vertexInputFeature = {
 };
 
 Camera camera;
+
+float gCameraYaw = -90.0f;
+float gCameraPitch = 0.0f;
+float gCameraMoveSpeed = 8.0f;
+float gCameraTurnSpeed = 80.0f;
 
 VkSemaphore frameSemaphores[COMMAND_BUFFER_COUNT];
 VkFence commandBufferFences[COMMAND_BUFFER_COUNT];
@@ -233,6 +246,18 @@ struct bufferDesc
     VkSharingMode sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 };
 
+struct TriangleFilteringPushConstants
+{
+    VkDeviceAddress indexBuffer;
+    VkDeviceAddress vertexBuffer;
+    VkDeviceAddress filteredBuffers[4];
+    VkDeviceAddress drawCommand;
+    alignas(16) glm::mat4 modelViewProjection;
+    uint32_t vertexStride;
+    uint32_t indexCount;
+    uint32_t vertexCount;
+};
+
 struct textureDesc
 {
     int width = 0;
@@ -306,6 +331,7 @@ VkPipeline gTFilteringPipeline;
 Shader            *gTFilteringShaders = nullptr;
 VkPipelineLayout  pipelineLayout;
 Buffer*           gTFilteredTriangles;
+Buffer*           gTFilterIndirectArgs;
 // GBuffer
 VkPipeline gBufferPipeline;
 VkRenderingInfo gBufferRenderInfo;
@@ -352,6 +378,7 @@ public:
         glm::vec3 normal;
         glm::vec2 uv;
         glm::vec3 color;
+        uint32_t textureIndex;
     };
 
     // The following structures roughly represent the glTF scene structure
@@ -394,7 +421,7 @@ public:
     struct Material
     {
         glm::vec4 baseColorFactor = glm::vec4(1.0f);
-        uint32_t baseColorTextureIndex;
+        uint32_t baseColorTextureIndex = 0;
     };
 
     struct Texture2D
@@ -432,6 +459,11 @@ public:
                         VkQueue copyQueue,
                         VkCommandPool commandPool)
         {
+            this->width = width;
+            this->height = height;
+            this->mipLevels = 1;
+            this->format = format;
+
             VkBuffer stagingBuffer;
             VkDeviceMemory stagingMemory;
 
@@ -570,6 +602,22 @@ public:
             vkFreeCommandBuffers(logicalDevice, commandPool, 1, &cmdBuffer);
             vkDestroyBuffer(logicalDevice, stagingBuffer, nullptr);
             vkFreeMemory(logicalDevice, stagingMemory, nullptr);
+
+            VkImageViewCreateInfo viewInfo{};
+            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            viewInfo.image = image;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = format;
+            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            viewInfo.subresourceRange.baseMipLevel = 0;
+            viewInfo.subresourceRange.levelCount = 1;
+            viewInfo.subresourceRange.baseArrayLayer = 0;
+            viewInfo.subresourceRange.layerCount = 1;
+            VK_CHECK(vkCreateImageView(logicalDevice, &viewInfo, nullptr, &view));
+
+            descInfo.imageView = view;
+            descInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            descInfo.sampler = VK_NULL_HANDLE;
         }
     };
 
@@ -731,6 +779,16 @@ public:
                 uint32_t firstIndex = static_cast<uint32_t>(indexBuffer.size());
                 uint32_t vertexStart = static_cast<uint32_t>(vertexBuffer.size());
                 uint32_t indexCount = 0;
+                uint32_t textureIndex = 0;
+                if (glTFPrimitive.material >= 0 &&
+                    static_cast<size_t>(glTFPrimitive.material) < materials.size())
+                {
+                    uint32_t gltfTextureIndex = materials[glTFPrimitive.material].baseColorTextureIndex;
+                    if (gltfTextureIndex < textures.size() && textures[gltfTextureIndex].imageIndex >= 0)
+                    {
+                        textureIndex = static_cast<uint32_t>(textures[gltfTextureIndex].imageIndex);
+                    }
+                }
                 // Vertices
                 {
                     const float *positionBuffer = nullptr;
@@ -770,6 +828,7 @@ public:
                         vert.normal = glm::normalize(glm::vec3(normalsBuffer ? glm::make_vec3(&normalsBuffer[v * 3]) : glm::vec3(0.0f)));
                         vert.uv = texCoordsBuffer ? glm::make_vec2(&texCoordsBuffer[v * 2]) : glm::vec3(0.0f);
                         vert.color = glm::vec3(1.0f);
+                        vert.textureIndex = textureIndex;
                         vertexBuffer.push_back(vert);
                     }
                 }
@@ -956,6 +1015,14 @@ public:
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocInfo.allocationSize = memReqs.size;
         allocInfo.memoryTypeIndex = memTypeIndex;
+
+        VkMemoryAllocateFlagsInfo allocFlagsInfo = {};
+        if (desc.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+        {
+            allocFlagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+            allocFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+            allocInfo.pNext = &allocFlagsInfo;
+        }
 
         VK_CHECK(vkAllocateMemory(device, &allocInfo, nullptr, &pBuffer->memory));
         VK_CHECK(vkBindBufferMemory(device, pBuffer->buffer, pBuffer->memory, 0));
@@ -1551,7 +1618,7 @@ public:
                     .descriptorCount = 3 * FRAMES_IN_FLIGHT},
 
                 {.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                    .descriptorCount = 4 + BISTRO_TEXTURE_COUNT},
+                    .descriptorCount = 6 + BISTRO_TEXTURE_COUNT},
 
                 {.type = VK_DESCRIPTOR_TYPE_SAMPLER,
                     .descriptorCount = 3},
@@ -1686,7 +1753,7 @@ public:
 
         VkPushConstantRange pushConstantRanges[1];
         pushConstantRanges->offset = 0;
-        pushConstantRanges->size = sizeof(VkDeviceAddress) * 6 + sizeof(uint32_t) * 3;
+        pushConstantRanges->size = sizeof(TriangleFilteringPushConstants);
         pushConstantRanges->stageFlags = VkShaderStageFlagBits::VK_SHADER_STAGE_COMPUTE_BIT;
 
         VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
@@ -1850,20 +1917,34 @@ public:
         writePersistent[5].dstSet = setsPersistent;
         writePersistent[5].dstBinding = 5;
         writePersistent[5].dstArrayElement = 0;
-        writePersistent[5].descriptorCount = DRAGON_TEXTURES_COUNT;
         writePersistent[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        // build a temporary array of VkDescriptorImageInfo from the DRAGON_TEXTURES pointers
-        
-        std::vector<VkDescriptorImageInfo> dragonImageInfos;
-        dragonImageInfos.reserve(DRAGON_TEXTURES_COUNT);
-        for (uint32_t i = 0; i < DRAGON_TEXTURES_COUNT; ++i)
+
+        std::vector<VkDescriptorImageInfo> meshImageInfos;
+        meshImageInfos.reserve(BISTRO_TEXTURE_COUNT);
+        if (!model_gltf.images.empty())
         {
-            if (DRAGON_TEXTURES[i])
-                dragonImageInfos.push_back(DRAGON_TEXTURES[i]->descInfo);
-            else
-                dragonImageInfos.push_back(VkDescriptorImageInfo{}); 
+            uint32_t textureCount = std::min<uint32_t>(static_cast<uint32_t>(model_gltf.images.size()), BISTRO_TEXTURE_COUNT);
+            for (uint32_t i = 0; i < textureCount; ++i)
+            {
+                meshImageInfos.push_back(model_gltf.images[i].texture.descInfo);
+            }
         }
-        writePersistent[5].pImageInfo = dragonImageInfos.data(); 
+        else
+        {
+            for (uint32_t i = 0; i < DRAGON_TEXTURES_COUNT; ++i)
+            {
+                if (DRAGON_TEXTURES[i])
+                    meshImageInfos.push_back(DRAGON_TEXTURES[i]->descInfo);
+                else
+                    meshImageInfos.push_back(VkDescriptorImageInfo{});
+            }
+        }
+        while (!meshImageInfos.empty() && meshImageInfos.size() < BISTRO_TEXTURE_COUNT)
+        {
+            meshImageInfos.push_back(meshImageInfos[0]);
+        }
+        writePersistent[5].descriptorCount = static_cast<uint32_t>(meshImageInfos.size());
+        writePersistent[5].pImageInfo = meshImageInfos.data();
     
         // binding 6 — RT sampler 1
         writePersistent[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2283,9 +2364,59 @@ public:
         return true;
     }
 
-    void Update(){
+    void Update(uint32_t frameIndex)
+    {
+        static double previousTime = glfwGetTime();
+        double currentTime = glfwGetTime();
+        float deltaTime = static_cast<float>(currentTime - previousTime);
+        previousTime = currentTime;
 
+        glm::vec3 moveDelta(0.0f);
+        glm::vec3 forward = glm::normalize(glm::vec3(camera.dir.x, 0.0f, camera.dir.z));
+        glm::vec3 right = glm::normalize(glm::cross(forward, camera.worldUp));
+        float moveAmount = gCameraMoveSpeed * deltaTime;
 
+        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+            moveDelta += forward * moveAmount;
+        if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+            moveDelta -= forward * moveAmount;
+        if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+            moveDelta += right * moveAmount;
+        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+            moveDelta -= right * moveAmount;
+        if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS)
+            moveDelta += camera.worldUp * moveAmount;
+        if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS)
+            moveDelta -= camera.worldUp * moveAmount;
+
+        if (glm::length(moveDelta) > 0.0f)
+        {
+            camera.setPosition(camera.pos + moveDelta);
+        }
+
+        float turnAmount = gCameraTurnSpeed * deltaTime;
+        if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS)
+            gCameraYaw -= turnAmount;
+        if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS)
+            gCameraYaw += turnAmount;
+        if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS)
+            gCameraPitch += turnAmount;
+        if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS)
+            gCameraPitch -= turnAmount;
+
+        gCameraPitch = std::clamp(gCameraPitch, -89.0f, 89.0f);
+
+        glm::vec3 direction;
+        direction.x = cos(glm::radians(gCameraYaw)) * cos(glm::radians(gCameraPitch));
+        direction.y = sin(glm::radians(gCameraPitch));
+        direction.z = sin(glm::radians(gCameraYaw)) * cos(glm::radians(gCameraPitch));
+        camera.setDirection(glm::normalize(direction));
+        camera.updateViewMatrix();
+
+        UniformData.cameraPos = camera.pos;
+        UniformData.proj = camera.getProjMatrix();
+        UniformData.view = camera.getViewMatrix();
+        mapBuffer(device, uboBuffer[frameIndex], &UniformData);
     }
 
     void Draw()
@@ -2299,6 +2430,15 @@ public:
         uint32_t imageIndex = 0;
         VkSemaphore frameSemaphore = frameSemaphores[frameIndex];
         VK_CHECK(vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, frameSemaphore, VK_NULL_HANDLE, &imageIndex));
+
+        VkDrawIndexedIndirectCommand filteringDrawCommand = {};
+        filteringDrawCommand.instanceCount = 1;
+        if (gTFilterIndirectArgs)
+        {
+            mapBuffer(device, gTFilterIndirectArgs, &filteringDrawCommand);
+        }
+
+        Update(frameIndex);
 
         VkCommandBuffer cmd = commandBuffers[frameIndex];
         vkResetCommandBuffer(cmd, 0);
@@ -2387,13 +2527,80 @@ public:
         VkRect2D scissor = {};
         scissor.extent = {gAppSettings->width, gAppSettings->height};
 
+        // compute triangle filtering
+        {
+            auto getBufferAddress = [this](VkBuffer buffer)
+            {
+                VkBufferDeviceAddressInfo addressInfo = {};
+                addressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+                addressInfo.buffer = buffer;
+                return vkGetBufferDeviceAddress(device, &addressInfo);
+            };
+
+            TriangleFilteringPushConstants filteringPushConstants = {};
+            filteringPushConstants.indexBuffer = getBufferAddress(model_gltf.indexBufferVk->buffer);
+            filteringPushConstants.vertexBuffer = getBufferAddress(model_gltf.vertexBufferVk->buffer);
+            if (gTFilteredTriangles)
+            {
+                filteringPushConstants.filteredBuffers[0] = getBufferAddress(gTFilteredTriangles->buffer);
+            }
+            if (gTFilterIndirectArgs)
+            {
+                filteringPushConstants.drawCommand = getBufferAddress(gTFilterIndirectArgs->buffer);
+            }
+            filteringPushConstants.modelViewProjection = UniformData.proj * UniformData.view * UniformData.model;
+            filteringPushConstants.vertexStride = sizeof(VulkanglTFModel::Vertex);
+            filteringPushConstants.indexCount = model_gltf.indextotalCount;
+            filteringPushConstants.vertexCount = model_gltf.vertextotalCount;
+
+            constexpr uint32_t filteringThreadGroupSize = 256;
+            const uint32_t triangleCount = (model_gltf.indextotalCount + 2) / 3;
+            const uint32_t groupCount = (triangleCount + filteringThreadGroupSize - 1) / filteringThreadGroupSize;
+
+            if (gTFilteringPipeline && gTFilteredTriangles && gTFilterIndirectArgs && groupCount > 0)
+            {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gTFilteringPipeline);
+                vkCmdPushConstants(cmd,
+                                   pipelineLayout,
+                                   VK_SHADER_STAGE_COMPUTE_BIT,
+                                   0,
+                                   sizeof(TriangleFilteringPushConstants),
+                                   &filteringPushConstants);
+                vkCmdDispatch(cmd, groupCount, 1, 1);
+
+                VkBufferMemoryBarrier filterBarriers[2] = {};
+                filterBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                filterBarriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                filterBarriers[0].dstAccessMask = VK_ACCESS_INDEX_READ_BIT;
+                filterBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                filterBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                filterBarriers[0].buffer = gTFilteredTriangles->buffer;
+                filterBarriers[0].offset = 0;
+                filterBarriers[0].size = gTFilteredTriangles->size;
+
+                filterBarriers[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                filterBarriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                filterBarriers[1].dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+                filterBarriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                filterBarriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                filterBarriers[1].buffer = gTFilterIndirectArgs->buffer;
+                filterBarriers[1].offset = 0;
+                filterBarriers[1].size = gTFilterIndirectArgs->size;
+
+                vkCmdPipelineBarrier(cmd,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                                     0, 0, nullptr, 2, filterBarriers, 0, nullptr);
+            }
+        }
+
         vkCmdBeginRendering(cmd, &gbufferRenderingInfo);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gBufferPipeline);
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-        VkDescriptorSet gbufferSet = setsPerFrame[frameIndex];
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 1, 1, &gbufferSet, 0, nullptr);
+        VkDescriptorSet gbufferSets[2] = {setsPersistent, setsPerFrame[frameIndex]};
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 2, gbufferSets, 0, nullptr);
 
         VkDeviceSize offset = 0;
        
@@ -2436,8 +2643,16 @@ public:
         */
 
         vkCmdBindVertexBuffers(cmd, 0, 1, &model_gltf.vertexBufferVk->buffer, &offset);
-        vkCmdBindIndexBuffer(cmd, model_gltf.indexBufferVk->buffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, model_gltf.indextotalCount, 1, 0, 0, 0);
+        if (gTFilteredTriangles && gTFilterIndirectArgs)
+        {
+            vkCmdBindIndexBuffer(cmd, gTFilteredTriangles->buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexedIndirect(cmd, gTFilterIndirectArgs->buffer, 0, 1, sizeof(VkDrawIndexedIndirectCommand));
+        }
+        else
+        {
+            vkCmdBindIndexBuffer(cmd, model_gltf.indexBufferVk->buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, model_gltf.indextotalCount, 1, 0, 0, 0);
+        }
 
         vkCmdEndRendering(cmd);
 
@@ -2754,16 +2969,17 @@ public:
     
         // Compute and Filtering Shaders 
         {
-            composeShader = new Shader();
+            shaderComputerFiltering = new Shader();
 
-            auto triangleFilteringShaders = LoadShaderCode("shaders/fullscreen.vert.spv");
+            auto triangleFilteringShaders = LoadShaderCode("shaders/filtering.comp.spv");
+            assert(triangleFilteringShaders.size() != 0);
 
             VkShaderModuleCreateInfo shaderModuleDesc = {};
             shaderModuleDesc.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
             shaderModuleDesc.pCode = reinterpret_cast<const uint32_t *>(triangleFilteringShaders.data());
             shaderModuleDesc.codeSize = triangleFilteringShaders.size() * 4;
 
-            VK_CHECK(vkCreateShaderModule(device, &shaderModuleDesc, nullptr, &composeShader->vert));
+            VK_CHECK(vkCreateShaderModule(device, &shaderModuleDesc, nullptr, &shaderComputerFiltering->comp));
 
         } 
     
@@ -2881,7 +3097,7 @@ public:
             bindingDescription.stride = sizeof(VulkanglTFModel::Vertex); // 32 bytes (8 floats)
             bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-            VkVertexInputAttributeDescription attributeDescriptions[3] = {};
+            VkVertexInputAttributeDescription attributeDescriptions[4] = {};
 
             attributeDescriptions[0].binding = 0;
             attributeDescriptions[0].location = 0;
@@ -2898,11 +3114,16 @@ public:
             attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
             attributeDescriptions[2].offset = offsetof(VulkanglTFModel::Vertex, uv); // 24
 
+            attributeDescriptions[3].binding = 0;
+            attributeDescriptions[3].location = 3;
+            attributeDescriptions[3].format = VK_FORMAT_R32_UINT;
+            attributeDescriptions[3].offset = offsetof(VulkanglTFModel::Vertex, textureIndex);
+
             VkPipelineVertexInputStateCreateInfo vertexInputInfo = {};
             vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
             vertexInputInfo.vertexBindingDescriptionCount = 1;
             vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
-            vertexInputInfo.vertexAttributeDescriptionCount = 3;
+            vertexInputInfo.vertexAttributeDescriptionCount = 4;
             vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions;
 
             // Input assembly
@@ -3284,6 +3505,8 @@ public:
 
         // feature chainig
         {
+            descriptorIndexingFeature.pNext = &bufferDeviceAddressFeature;
+            eds3.pNext = &descriptorIndexingFeature;
             colorWriteFeature.pNext = &vertexInputFeature;
         
         }
@@ -3569,6 +3792,10 @@ public:
         std::vector<uint32_t> indexBuffer;
         std::vector<VulkanglTFModel::Vertex> vertexBuffer;
 
+        model_gltf.loadMaterials(model);
+        model_gltf.loadTextures(model);
+        model_gltf.loadImages(model);
+
         for (uint32_t cur_node = 0; cur_node < model.nodes.size(); cur_node++)
         {
             model_gltf.loadNode(
@@ -3582,10 +3809,6 @@ public:
            
             );
         }
-
-        model_gltf.loadMaterials(model);
-        model_gltf.loadImages(model);
-        model_gltf.loadTextures(model);
 
         model_gltf.indextotalCount = indexBuffer.size();
         model_gltf.vertextotalCount = vertexBuffer.size();
@@ -3609,6 +3832,7 @@ public:
         indexBuffer  = std::move(new_indices);
         vertexBuffer = std::move(new_vertices);
         vertex_count = unique_vertex_count;
+        model_gltf.vertextotalCount = static_cast<uint32_t>(vertex_count);
 
         {
             // vertex buffer
@@ -3616,7 +3840,9 @@ public:
                 bufferDesc sponzaVertexBufDesc = {};
                 sponzaVertexBufDesc.size = sizeof(VulkanglTFModel::Vertex) * vertexBuffer.size();
                 sponzaVertexBufDesc.sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE;
-                sponzaVertexBufDesc.usage = VkBufferUsageFlagBits::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+                sponzaVertexBufDesc.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
                 sponzaVertexBufDesc.memoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
 
                 addBuffer(device, physicalDevice, sponzaVertexBufDesc, &model_gltf.vertexBufferVk);
@@ -3630,12 +3856,39 @@ public:
 
                 sponzaIndexBuffer.size = sizeof(uint32_t) * indexBuffer.size();
                 sponzaIndexBuffer.sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE;
-                sponzaIndexBuffer.usage = VkBufferUsageFlagBits::VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+                sponzaIndexBuffer.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
                 sponzaIndexBuffer.memoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
 
                 addBuffer(device, physicalDevice, sponzaIndexBuffer, &model_gltf.indexBufferVk);
 
                 mapBuffer(device, model_gltf.indexBufferVk, indexBuffer.data());
+            }
+            // filtered index buffer
+            {
+                bufferDesc filteredIndexBuffer = {};
+                filteredIndexBuffer.size = sizeof(uint32_t) * indexBuffer.size();
+                filteredIndexBuffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                filteredIndexBuffer.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+                filteredIndexBuffer.memoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+                addBuffer(device, physicalDevice, filteredIndexBuffer, &gTFilteredTriangles);
+            }
+            // filtered draw command
+            {
+                bufferDesc filteredDrawCommand = {};
+                filteredDrawCommand.size = sizeof(VkDrawIndexedIndirectCommand);
+                filteredDrawCommand.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                filteredDrawCommand.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+                filteredDrawCommand.memoryProperties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+                addBuffer(device, physicalDevice, filteredDrawCommand, &gTFilterIndirectArgs);
             }
         }
 

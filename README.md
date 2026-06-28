@@ -23,7 +23,7 @@
 
 - [x] G-buffer pass using `gbuffer.vert` and `gbuffer.frag`
 - [x] G-buffer normal/specular target: `R16G16B16A16_SFLOAT`
-- [x] G-buffer albedo target: `R8G8B8A8_SNORM`
+- [x] G-buffer albedo target: `R8G8B8A8_UNORM`
 - [x] Depth target: `D32_SFLOAT`
 - [x] Fullscreen triangle shader for post passes: `fullscreen.vert`
 - [x] SSAO pass using `ssao.frag`
@@ -38,22 +38,22 @@
 ## Active work
 
 - [ ] SSAO blur math in `ssao_blur.comp`
-- [ ] Triangle filtering runtime pass using `filtering.comp`
-- [ ] Filtered triangle buffer used by the draw call
+- [x] Triangle filtering runtime pass using `filtering.comp`
+- [x] Filtered triangle buffer used by the draw call
 - [ ] Shadow depth pass
 - [ ] Deferred lighting pass
-- [ ] Material texture sampling in the G-buffer shader
+- [x] Material texture sampling in the G-buffer shader
 
 ## Future Roadmap
 
-- [ ] Triangle filtering compute pass
-- [ ] GPU frustum culling pass
+- [x] Triangle filtering compute pass
+- [x] GPU frustum culling pass
 - [ ] GPU occlusion culling with a depth pyramid
-- [ ] GPU indirect draw command buffer
+- [x] GPU indirect draw command buffer
 - [ ] Meshlet generation with `meshoptimizer`
 - [ ] Meshlet culling pass
 - [ ] Runtime LOD selection
-- [ ] Particle system 
+- [ ] Particle system
 - [ ] Particle collision against depth
 - [ ] Shadow map pass
 - [ ] Point light shadow cubemaps
@@ -78,7 +78,7 @@
 - [ ] Texture cache
 - [ ] Async asset loading jobs
 - [ ] Screenshot capture
-- [ ] Fly camera input controls
+- [x] Fly camera input controls
 - [ ] README screenshots
 
 ## Build And Run
@@ -127,5 +127,4 @@ cmake --build build --target shaders
 cmake --build build --target vkml
 cmake --build build --target clean
 ```
-
 

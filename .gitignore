@@ -23,33 +23,3 @@ external/**/Makefile
 
 /external/sponza/
 /external/sponza_intel/
-
-*.o
-*.obj
-*.a
-*.so
-*.so.*
-*.dylib
-*.dll
-*.exe
-*.pdb
-
-*.spv
-*.fsl
-
-imgui.ini
-*.log
-*.trace
-*.prof
-
-/.cache/
-/.docs/
-.vscode/.browse.VC.db*
-.vscode/ipch/
-*.swp
-*.swo
-*~
-
-# OS files
-.DS_Store
-Thumbs.db
