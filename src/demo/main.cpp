@@ -1,6 +1,7 @@
 #include "tinygltf/tiny_gltf.h"
 
 
+#include <glm/fwd.hpp>
 #include <vulkan/vulkan.h>
 #include <vector>
 #include "GLFW/glfw3.h"
@@ -19,8 +20,10 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <meshoptimizer/src/meshoptimizer.h>
 #include <vulkan/vulkan_core.h>
+#include "tracy/TracyVulkan.hpp"
 
 #define MAX_SHADOW_CASCADES 4
+#define SHADOW_MAP_SIZE 2048
 #define COMMAND_BUFFER_COUNT 2
 #define GBUFFER_ATTACHMENT_COUNT 10
 #define BISTRO_TEXTURE_COUNT 255
@@ -32,9 +35,11 @@
 #define DRAGON_TEXTURES_COUNT 2
 #define SSAO_KERNEL_SIZE  32
 #define SSAO_NOISE_DIM 4
+#define MAX_POINT_LIGHTS      1
+#define MAX_DIRECTIONAL_LIGHT 1
 
 VkFormat swapchainFormat[1] = {VK_FORMAT_B8G8R8A8_SRGB};
-
+TracyVkCtx tracyGpuContext;
 std::set<std::string> requiredExtensions = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
     VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,
@@ -115,22 +120,36 @@ struct DragonVkBuffers
 
 VkPhysicalDeviceFeatures2 deviceFeatures2;
 
+struct alignas(16) ShadowCascadeData
+{
+    alignas(16) glm::mat4 viewProj = glm::mat4(1.0f);
+    alignas(4) float splitDepth = 0.0f;
+    alignas(4) float padding[3] = {};
+};
+
+struct alignas(16) ShadowGenerationUniform
+{
+    alignas(16) ShadowCascadeData cascades[MAX_SHADOW_CASCADES];
+    alignas(16) glm::vec4 lightDirection = glm::vec4(0.0f);
+    alignas(16) glm::uvec4 shadowMapSizeCascadeCount = glm::uvec4(0);
+    alignas(16) glm::vec4 bias = glm::vec4(0.0f);
+};
+
+static_assert(sizeof(ShadowCascadeData) % 16 == 0);
+static_assert(sizeof(ShadowGenerationUniform) % 16 == 0);
+
 struct SkyLightUniform
 {
     alignas(16) glm::vec3 lightDirection;
     alignas(16) glm::vec3 lightColor;
     alignas(4) float lightIntensity;
-
-    alignas(16) glm::mat4 cascadeViewProj[MAX_SHADOW_CASCADES];
-    alignas(4) float cascadeSplitDepth[MAX_SHADOW_CASCADES];
-    alignas(4) int cascadeCount;
-    alignas(4) float shadowBias;
 };
 
 SkyLightUniform SkyLightUniformData;
+ShadowGenerationUniform ShadowGenUniformData;
 
-constexpr uint32_t PERSISTENT_BINDING_COUNT = 11;
-constexpr uint32_t PER_FRAME_BINDING_COUNT = 2;
+constexpr uint32_t PERSISTENT_BINDING_COUNT = 12;
+constexpr uint32_t PER_FRAME_BINDING_COUNT = 3;
 constexpr uint32_t FRAMES_IN_FLIGHT = 2;
 
 std::string dragon_textures_pathes[2] = {"../external/dragon/checkerboard.png", "../external/dragon/Dragon_ThicknessMap.jpg"};
@@ -258,6 +277,41 @@ struct TriangleFilteringPushConstants
     uint32_t vertexCount;
 };
 
+struct PointLightPushConstants
+{
+    alignas(16) glm::vec4 positionRadius;
+    alignas(16) glm::vec4 colorIntensity;
+};
+struct DirectionalLightPushConstants
+{
+    alignas(16) glm::vec4 directionIntensity;
+    alignas(16) glm::vec4 color;
+};
+
+// Compose push constants for light calculation.
+struct ComposePushConstants {
+
+    DirectionalLightPushConstants directionalLight[MAX_DIRECTIONAL_LIGHT];
+    //int active_directionalLight = 0;
+
+    PointLightPushConstants pointLight[MAX_POINT_LIGHTS];
+    //int active_pointlight       = 0;
+
+};
+
+struct LightsData_buffer{
+
+    DirectionalLightPushConstants directionalLight[MAX_DIRECTIONAL_LIGHT];
+    //int active_directionalLight = 0;
+
+    PointLightPushConstants pointLight[MAX_POINT_LIGHTS];
+    //int active_pointlight       = 0;
+
+};
+
+DirectionalLightPushConstants directionalLight_buffer;
+PointLightPushConstants       pointLight_buffer;
+
 struct textureDesc
 {
     int width = 0;
@@ -293,9 +347,20 @@ struct RenderTarget
     VkSampler sampler;
     VkDescriptorImageInfo imageInfo;
 };
+ 
+struct ShadowRenderTargets
+{
+    RenderTarget *cascadeDepth = nullptr;
+    VkImageView cascadeLayerViews[MAX_SHADOW_CASCADES] = {};
+};
 
+ShadowRenderTargets gShadowRenderTargets;
+
+
+
+// Resource Buffers
 Buffer *shadowGenBuffer[FRAMES_IN_FLIGHT];
-Buffer *lightsDataBuffer[FRAMES_IN_FLIGHT];
+Buffer *SkyLightsDataBuffer[FRAMES_IN_FLIGHT];
 Buffer *uboBuffer[FRAMES_IN_FLIGHT];
 Buffer *ssaoKernelBuffer;
 
@@ -504,7 +569,7 @@ public:
             imageDesc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             imageDesc.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             vkCreateImage(logicalDevice, &imageDesc, nullptr, &image);
-
+            
             VkMemoryRequirements imgMemReqs;
             vkGetImageMemoryRequirements(logicalDevice, image, &imgMemReqs);
 
@@ -1286,9 +1351,19 @@ public:
         delete pTexture;
     }
 
-    void updateSkyLight()
+    void updateSkyLight(uint32_t frameIndex)
     {
-      
+        UpdateShadowGenerationData(hasShadowRenderTargets());
+
+        if (shadowGenBuffer[frameIndex])
+        {
+            mapBuffer(device, shadowGenBuffer[frameIndex], &ShadowGenUniformData);
+        }
+
+        if (SkyLightsDataBuffer[frameIndex])
+        {
+            mapBuffer(device, SkyLightsDataBuffer[frameIndex], &SkyLightUniformData);
+        }
     }
 
     void setupUBO()
@@ -1361,15 +1436,27 @@ public:
         
             {
         
+                bufferDesc bufferDescShadowGen = {};
+                bufferDescShadowGen.size = sizeof(ShadowGenerationUniform);
+                bufferDescShadowGen.sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE;
+                bufferDescShadowGen.usage = VkBufferUsageFlagBits::VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+                bufferDescShadowGen.memoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+                addBuffer(device, physicalDevice, bufferDescShadowGen, &shadowGenBuffer[curr_buffer]);
+
+                mapBuffer(device, shadowGenBuffer[curr_buffer], &ShadowGenUniformData);
+            }
+
+            {
+
                 bufferDesc bufferDescLightsData = {};
 
                 bufferDescLightsData.size = sizeof(SkyLightUniform);
                 bufferDescLightsData.sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE;
                 bufferDescLightsData.usage = VkBufferUsageFlagBits::VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
                 bufferDescLightsData.memoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-                addBuffer(device, physicalDevice, bufferDescLightsData, &lightsDataBuffer[curr_buffer]);
+                addBuffer(device, physicalDevice, bufferDescLightsData, &SkyLightsDataBuffer[curr_buffer]);
 
-                mapBuffer(device, lightsDataBuffer[curr_buffer], &SkyLightUniformData);
+                mapBuffer(device, SkyLightsDataBuffer[curr_buffer], &SkyLightUniformData);
             }
             
         }
@@ -1600,6 +1687,7 @@ public:
         // sampler for render targets   -> 6
         // sampler for render targets 2 -> 7
         // sampler for textures         -> 8
+        // shadow cascade depth RT      -> 11
 
         VkDescriptorPoolCreateInfo poolDesc;
 
@@ -1618,7 +1706,7 @@ public:
                     .descriptorCount = 3 * FRAMES_IN_FLIGHT},
 
                 {.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                    .descriptorCount = 6 + BISTRO_TEXTURE_COUNT},
+                    .descriptorCount = 7 + BISTRO_TEXTURE_COUNT},
 
                 {.type = VK_DESCRIPTOR_TYPE_SAMPLER,
                     .descriptorCount = 3},
@@ -1646,6 +1734,12 @@ public:
             perFrameBinding[1].descriptorCount = 1;
             perFrameBinding[1].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
             perFrameBinding[1].pImmutableSamplers = nullptr;
+
+            perFrameBinding[2].binding = 2;
+            perFrameBinding[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            perFrameBinding[2].descriptorCount = 1;
+            perFrameBinding[2].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+            perFrameBinding[2].pImmutableSamplers = nullptr;
 
             VkDescriptorSetLayoutCreateInfo lPerFrameDesc = {};
             lPerFrameDesc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -1710,7 +1804,7 @@ public:
             persistentBinding[6].pImmutableSamplers = nullptr;
 
             // binding 7 — RT sampler 2
-            persistentBinding[7].binding =7;
+            persistentBinding[7].binding = 7;
             persistentBinding[7].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
             persistentBinding[7].descriptorCount = 1;
             persistentBinding[7].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
@@ -1730,11 +1824,18 @@ public:
             persistentBinding[9].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
             persistentBinding[9].pImmutableSamplers = nullptr;
             // SSAO Kernels 
-            persistentBinding[10].binding =10;
+            persistentBinding[10].binding = 10;
             persistentBinding[10].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             persistentBinding[10].descriptorCount = 1;
             persistentBinding[10].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
             persistentBinding[10].pImmutableSamplers = nullptr;
+
+            // Shadow cascade depth RT
+            persistentBinding[11].binding = 11;
+            persistentBinding[11].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            persistentBinding[11].descriptorCount = 1;
+            persistentBinding[11].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+            persistentBinding[11].pImmutableSamplers = nullptr;
 
            
             VkDescriptorSetLayoutCreateInfo lPersistentDesc = {};
@@ -1753,8 +1854,8 @@ public:
 
         VkPushConstantRange pushConstantRanges[1];
         pushConstantRanges->offset = 0;
-        pushConstantRanges->size = sizeof(TriangleFilteringPushConstants);
-        pushConstantRanges->stageFlags = VkShaderStageFlagBits::VK_SHADER_STAGE_COMPUTE_BIT;
+        pushConstantRanges->size = std::max(sizeof(TriangleFilteringPushConstants), sizeof(ComposePushConstants));
+        pushConstantRanges->stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
         VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
         pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1772,15 +1873,16 @@ public:
     {
         // set 0
         // per frame
-        // UBO Buffer      ->       1
-        // Light Data      ->       3
+        // UBO Buffer       ->      0
+        // Shadow Gen Data  ->      1
+        // Sky Light Data   ->      2
     
         for(uint32_t cur_set = 0; cur_set < FRAMES_IN_FLIGHT; cur_set++)
         {
 
             VkWriteDescriptorSet writePerFrame[PER_FRAME_BINDING_COUNT] = {};
 
-            // binding 1 — UBO Buffer
+            // binding 0 — UBO Buffer
             writePerFrame[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writePerFrame[0].pNext = nullptr;
             writePerFrame[0].dstSet = setsPerFrame[cur_set];
@@ -1790,7 +1892,7 @@ public:
             writePerFrame[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             writePerFrame[0].pBufferInfo = &uboBuffer[cur_set]->descInfo;
 
-            // binding 3 — Lights Data
+            // binding 1 - shadow generation data
             writePerFrame[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writePerFrame[1].pNext = nullptr;
             writePerFrame[1].dstSet = setsPerFrame[cur_set];
@@ -1798,7 +1900,17 @@ public:
             writePerFrame[1].dstArrayElement = 0;
             writePerFrame[1].descriptorCount = 1;
             writePerFrame[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            writePerFrame[1].pBufferInfo = &lightsDataBuffer[cur_set]->descInfo;
+            writePerFrame[1].pBufferInfo = &shadowGenBuffer[cur_set]->descInfo;
+
+            // binding 2 — Sky Light Data
+            writePerFrame[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writePerFrame[2].pNext = nullptr;
+            writePerFrame[2].dstSet = setsPerFrame[cur_set];
+            writePerFrame[2].dstBinding = 2;
+            writePerFrame[2].dstArrayElement = 0;
+            writePerFrame[2].descriptorCount = 1;
+            writePerFrame[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writePerFrame[2].pBufferInfo = &SkyLightsDataBuffer[cur_set]->descInfo;
 
             vkUpdateDescriptorSets(device,
                                    PER_FRAME_BINDING_COUNT,
@@ -1996,6 +2108,16 @@ public:
         writePersistent[10].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         writePersistent[10].pBufferInfo = &ssaoKernelBuffer->descInfo;
 
+        // Shadow cascade depth RT
+        writePersistent[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writePersistent[11].pNext = nullptr;
+        writePersistent[11].dstSet = setsPersistent;
+        writePersistent[11].dstBinding = 11;
+        writePersistent[11].dstArrayElement = 0;
+        writePersistent[11].descriptorCount = 1;
+        writePersistent[11].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writePersistent[11].pImageInfo = &gShadowRenderTargets.cascadeDepth->imageInfo;
+
         vkUpdateDescriptorSets(device,
                                 PERSISTENT_BINDING_COUNT,
                                 writePersistent,
@@ -2170,8 +2292,66 @@ public:
         VkImageLayout descriptorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         pRT->imageInfo.imageLayout = descriptorLayout;
-        pRT->imageInfo.imageView = pRT->imageView;
+        pRT->imageInfo.imageView = pRT->sampledView != VK_NULL_HANDLE ? pRT->sampledView : pRT->imageView;
         pRT->imageInfo.sampler = VK_NULL_HANDLE; // set externally if COMBINED_IMAGE_SAMPLER
+    }
+
+    void addShadowCascadeLayerViews()
+    {
+        RenderTarget *shadowDepth = gShadowRenderTargets.cascadeDepth;
+        assert(shadowDepth && shadowDepth->image != VK_NULL_HANDLE);
+
+        for (uint32_t cascadeIndex = 0; cascadeIndex < MAX_SHADOW_CASCADES; ++cascadeIndex)
+        {
+            VkImageViewCreateInfo viewInfo = {};
+            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            viewInfo.image = shadowDepth->image;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = shadowDepth->format;
+            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            viewInfo.subresourceRange.baseMipLevel = 0;
+            viewInfo.subresourceRange.levelCount = 1;
+            viewInfo.subresourceRange.baseArrayLayer = cascadeIndex;
+            viewInfo.subresourceRange.layerCount = 1;
+
+            VK_CHECK(vkCreateImageView(device,
+                                       &viewInfo,
+                                       nullptr,
+                                       &gShadowRenderTargets.cascadeLayerViews[cascadeIndex]));
+        }
+    }
+
+    bool hasShadowRenderTargets() const
+    {
+        const RenderTarget *shadowDepth = gShadowRenderTargets.cascadeDepth;
+        if (!shadowDepth ||
+            shadowDepth->image == VK_NULL_HANDLE ||
+            shadowDepth->imageView == VK_NULL_HANDLE ||
+            shadowDepth->sampledView == VK_NULL_HANDLE)
+        {
+            return false;
+        }
+
+        for (uint32_t cascadeIndex = 0; cascadeIndex < MAX_SHADOW_CASCADES; ++cascadeIndex)
+        {
+            if (gShadowRenderTargets.cascadeLayerViews[cascadeIndex] == VK_NULL_HANDLE)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void syncShadowGenerationBuffers()
+    {
+        for (uint32_t frameIndex = 0; frameIndex < FRAMES_IN_FLIGHT; ++frameIndex)
+        {
+            if (shadowGenBuffer[frameIndex])
+            {
+                mapBuffer(device, shadowGenBuffer[frameIndex], &ShadowGenUniformData);
+            }
+        }
     }
 
     GLFWwindow *CreateWindow(int width, int height, const char *title)
@@ -2321,6 +2501,32 @@ public:
                     addRenderTarget(device, physicalDevice, &depthDesc, &gDepthBufferRT);
                 }
             }
+
+            // Shadow Render Targets
+            {
+                RenderTargetDesc shadowDepthDesc{};
+                shadowDepthDesc.width = SHADOW_MAP_SIZE;
+                shadowDepthDesc.height = SHADOW_MAP_SIZE;
+                shadowDepthDesc.arraySize = MAX_SHADOW_CASCADES;
+                shadowDepthDesc.mipLevels = 1;
+                shadowDepthDesc.format = VK_FORMAT_D32_SFLOAT;
+                shadowDepthDesc.usageFlags = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                shadowDepthDesc.clearValue = {.depthStencil = {1.0f, 0}};
+                shadowDepthDesc.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+                shadowDepthDesc.startLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                shadowDepthDesc.pName = "Shadow_CascadeDepthRT";
+
+                addRenderTarget(device, physicalDevice, &shadowDepthDesc, &gShadowRenderTargets.cascadeDepth);
+                addShadowCascadeLayerViews();
+
+                if (!hasShadowRenderTargets())
+                {
+                    throw std::runtime_error("Shadow render targets were not created correctly");
+                }
+
+                UpdateShadowGenerationData(true);
+                syncShadowGenerationBuffers();
+            }
         }
     }
     void CreateCommandPool()
@@ -2417,10 +2623,12 @@ public:
         UniformData.proj = camera.getProjMatrix();
         UniformData.view = camera.getViewMatrix();
         mapBuffer(device, uboBuffer[frameIndex], &UniformData);
+        updateSkyLight(frameIndex);
     }
 
     void Draw()
     {
+ 
         static uint32_t frameIndex = 0;
 
         VkFence frameFence = commandBufferFences[frameIndex];
@@ -2439,15 +2647,19 @@ public:
         }
 
         Update(frameIndex);
-
+        
         VkCommandBuffer cmd = commandBuffers[frameIndex];
+ 
         vkResetCommandBuffer(cmd, 0);
 
         VkCommandBufferBeginInfo beginInfo = {};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
-
+       
+        {
+        TracyVkZone(tracyGpuContext, cmd, "Scene Rendering Pass");
+  
         {
             VkImageMemoryBarrier barriers[3] = {};
 
@@ -2562,7 +2774,7 @@ public:
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gTFilteringPipeline);
                 vkCmdPushConstants(cmd,
                                    pipelineLayout,
-                                   VK_SHADER_STAGE_COMPUTE_BIT,
+                                   VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                    0,
                                    sizeof(TriangleFilteringPushConstants),
                                    &filteringPushConstants);
@@ -2859,7 +3071,9 @@ public:
                                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                  0, 0, nullptr, 0, nullptr, 1, &presentBarrier);
         }
-
+        }
+        TracyVkCollect(tracyGpuContext, cmd);
+        
         VK_CHECK(vkEndCommandBuffer(cmd));
 
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -2889,6 +3103,7 @@ public:
         VK_CHECK(vkQueuePresentKHR(presentQueue, &presentInfo));
 
         frameIndex = (frameIndex + 1) % FRAMES_IN_FLIGHT;
+
     }
 
     void addShaders()
@@ -3176,7 +3391,6 @@ public:
             dynamicState.dynamicStateCount = 4; 
             dynamicState.pDynamicStates = dynamicStates;
 
-
             /*
                             typedef struct VkPipelineRasterizationStateCreateInfo {
                 VkStructureType                            sType;
@@ -3194,6 +3408,7 @@ public:
                 float                                      lineWidth;
             } VkPipelineRasterizationStateCreateInfo;
             */
+
             VkPipelineColorBlendAttachmentState blendAttachments[2] = {};
             blendAttachments[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -3705,21 +3920,107 @@ public:
         return VK_FALSE;
     }
 
+    void UpdateCascades(
+        const Camera& camera,
+        const glm::vec3& lightDir,
+        ShadowCascadeData *cascades,
+        uint32_t cascadeCount)
+    {
+        cascadeCount = std::min<uint32_t>(cascadeCount, MAX_SHADOW_CASCADES);
+
+        // 1. Choose split depths
+        float nearPlane = camera.nearPlane;
+        float farPlane  = camera.farPlane;
+
+        for (uint32_t i = 0; i < cascadeCount; ++i)
+        {
+   
+            float p = float(i + 1) / float(cascadeCount);
+            cascades[i].splitDepth = nearPlane + (farPlane - nearPlane) * p;
+
+            // 2. Get frustum corners for this split range
+            glm::vec3 corners[8];
+            camera.getFrustumCornersWorldSpace(
+                (i == 0) ? nearPlane : cascades[i - 1].splitDepth,
+                cascades[i].splitDepth,
+                corners);
+
+            // 3) Create light view matrix
+            glm::vec3 center(0.0f);
+            for (int c = 0; c < 8; ++c)
+                center += corners[c];
+            center /= 8.0f;
+
+            glm::vec3 lightPos = center - lightDir * 100.0f;
+            glm::mat4 lightView = glm::lookAt(
+                lightPos,
+                center,
+                glm::vec3(0.0f, 1.0f, 0.0f));
+
+            // 4. Fit orthographic projection to the cascade
+            float minX =  FLT_MAX, minY =  FLT_MAX, minZ =  FLT_MAX;
+            float maxX = -FLT_MAX, maxY = -FLT_MAX, maxZ = -FLT_MAX;
+
+            for (int c = 0; c < 8; ++c)
+            {
+                glm::vec4 tr = lightView * glm::vec4(corners[c], 1.0f);
+                minX = std::min(minX, tr.x); maxX = std::max(maxX, tr.x);
+                minY = std::min(minY, tr.y); maxY = std::max(maxY, tr.y);
+                minZ = std::min(minZ, tr.z); maxZ = std::max(maxZ, tr.z);
+            }
+
+            glm::mat4 lightProj = glm::ortho(minX, maxX, minY, maxY, -maxZ - 50.0f, -minZ);
+            cascades[i].viewProj = lightProj * lightView;
+        
+        }
+    }
+
+    void UpdateShadowGenerationData(bool shadowRenderTargetsReady)
+    {
+        const uint32_t cascadeCount = MAX_SHADOW_CASCADES;
+
+        ShadowGenUniformData.lightDirection = glm::vec4(SkyLightUniformData.lightDirection, 0.0f);
+        ShadowGenUniformData.shadowMapSizeCascadeCount = glm::uvec4(
+            SHADOW_MAP_SIZE,
+            SHADOW_MAP_SIZE,
+            cascadeCount,
+            shadowRenderTargetsReady ? 1u : 0u);
+        ShadowGenUniformData.bias = glm::vec4(0.0005f, 0.0f, 0.0f, 0.0f);
+
+        UpdateCascades(camera, SkyLightUniformData.lightDirection, ShadowGenUniformData.cascades, cascadeCount);
+    }
+
+    void InitSkyLight() 
+    {
+   
+        setupUBO();
+   
+        SkyLightUniformData.lightColor          = glm::vec3(255, 255, 255);
+        SkyLightUniformData.lightDirection      = normalize(glm::vec3(-1,-1,-1));
+        SkyLightUniformData.lightIntensity      = 40; 
+        
+        // Cascade shadow mapping implementation of the rendering algorithm representing differenty diferent distance from the camera to have diferent quality of the shadow at each distance
+
+        UpdateShadowGenerationData(false);
+        
+    }
+  
 
     void Init()
     {
+    
         window = CreateWindow(800, 600, "main");
         gAppSettings = new AppSettings(); 
         gAppSettings->height = 600;
         gAppSettings->width= 800;
 
         VulkanInit();
-
+ 
         if (glfwCreateWindowSurface(instance, window, nullptr, &surface) != VK_SUCCESS)
         {
             throw std::runtime_error("Failed to create window surface!");
         }
-
+        
         PickPhysicalDevice(instance, physicalDevice, surface);
 
         CreateLogicalDevice(physicalDevice, device, graphicsQueue, presentQueue, surface);
@@ -3730,7 +4031,11 @@ public:
 
         CreateCommandBuffer();
 
+        tracyGpuContext = TracyVkContext(physicalDevice, device, graphicsQueue, commandBuffers[0]);
+
         addSamplers();
+
+        InitSkyLight();
 
         addBuffers();
 
@@ -3749,7 +4054,6 @@ public:
         addSwapChain();
 
         prepareDescriptorSetPerSistent();
-
         prepareDescriptorSetPerFrame();
         
         for (uint32_t i = 0; i < COMMAND_BUFFER_COUNT; ++i)
@@ -3850,6 +4154,7 @@ public:
                 mapBuffer(device, model_gltf.vertexBufferVk, vertexBuffer.data());
             
             }
+        
             // index buffer 
             {
                 bufferDesc sponzaIndexBuffer = {};
@@ -3865,6 +4170,7 @@ public:
 
                 mapBuffer(device, model_gltf.indexBufferVk, indexBuffer.data());
             }
+       
             // filtered index buffer
             {
                 bufferDesc filteredIndexBuffer = {};
@@ -3907,5 +4213,7 @@ int main(int argc, char const *argv[])
         glfwPollEvents();
         app.Draw();
     }
+        TracyVkDestroy(tracyGpuContext);
+
     return 0;
 }

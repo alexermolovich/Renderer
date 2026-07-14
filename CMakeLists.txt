@@ -28,6 +28,10 @@ add_library(imgui STATIC
     ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
+# Add Tracy directory (assume it's cloned into thirdparty/tracy)
+set(TRACY_ENABLE ON CACHE BOOL "Enable Tracy Profiler" FORCE)
+add_subdirectory(external/tracy)
+
 target_include_directories(imgui PUBLIC
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
@@ -83,7 +87,10 @@ target_link_libraries(vkml PRIVATE
     glm::glm
     meshoptimizer
     foundation 
-    )
+    Tracy::TracyClient
+
+
+  )
 
 
 
@@ -106,8 +113,8 @@ foreach(SHADER ${SHADERS})
 
     add_custom_command(
         OUTPUT ${SPIRV}
-        COMMAND ${Vulkan_GLSLC_EXECUTABLE} ${SHADER} -o ${SPIRV}
-        DEPENDS ${SHADER}
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} -I ${SHADER_DIR} ${SHADER} -o ${SPIRV}
+        DEPENDS ${SHADER} ${SHADER_DIR}/config.h
         COMMENT "Compiling shader ${FILE_NAME}"
     )
 
@@ -116,4 +123,3 @@ endforeach()
 
 add_custom_target(shaders ALL DEPENDS ${SPIRV_SHADERS})
 add_dependencies(vkml shaders)
-

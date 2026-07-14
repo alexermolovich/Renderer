@@ -26,6 +26,11 @@ public:
     void serialize(std::ofstream &wf) const;
     void deserialize(std::ifstream &wf);
 
+    void getFrustumCornersWorldSpace(
+        float nearPlane,
+        float farPlane,
+    
+    glm::vec3 corners[8]) const;
     glm::vec3 pos{};
     glm::vec3 dir{};
     glm::vec3 worldUp{};

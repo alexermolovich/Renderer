@@ -1,0 +1,18 @@
+{
+	"version": 3,
+	"configurePresets": [
+		{
+			"name": "wsl-linux-debug",
+			"displayName": "WSL Linux Debug",
+			"generator": "Ninja",
+			"binaryDir": "${sourceDir}/out/build/${presetName}",
+			"targetSystemName": "Linux",
+			"vendor": {
+				"://microsoft.com": {
+					"hostOS": [ "Linux" ]
+				}
+			}
+		}
+	]
+}
+fgvb 

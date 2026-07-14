@@ -91,3 +91,39 @@ void Camera::deserialize(std::ifstream &wf)
     hasChangedProj = true;
     hasChangedView = true;
 }
+
+void Camera::getFrustumCornersWorldSpace(
+    float nearPlane,
+    float farPlane,
+    glm::vec3 corners[8]) const
+{
+    glm::mat4 proj = glm::perspective(
+        glm::radians(FOV),
+        aspectRatio,
+        nearPlane,
+        farPlane);
+
+    // Vulkan clip space has an inverted Y axis.
+    proj[1][1] *= -1.0f;
+
+    glm::mat4 inv = glm::inverse(proj * getViewMatrix());
+
+    int index = 0;
+
+    for (int z = 0; z < 2; ++z)
+    {
+        for (int y = 0; y < 2; ++y)
+        {
+            for (int x = 0; x < 2; ++x)
+            {
+                glm::vec4 pt = inv * glm::vec4(
+                    x ? 1.0f : -1.0f,
+                    y ? 1.0f : -1.0f,
+                    z ? 1.0f : -1.0f,
+                    1.0f);
+
+                corners[index++] = glm::vec3(pt) / pt.w;
+            }
+        }
+    }
+}
