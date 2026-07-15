@@ -93,6 +93,16 @@ VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vertexInputFeature = {
 
 };
 
+
+/*
+    DOCS: FEATURES update INFO
+        Feature plan status
+        Cascade shadow mapping:
+        finish up the shader and update the draw function               
+*/
+
+
+
 Camera camera;
 
 float gCameraYaw = -90.0f;
@@ -269,12 +279,30 @@ struct TriangleFilteringPushConstants
 {
     VkDeviceAddress indexBuffer;
     VkDeviceAddress vertexBuffer;
-    VkDeviceAddress filteredBuffers[4];
+    VkDeviceAddress filteredBuffers;
     VkDeviceAddress drawCommand;
     alignas(16) glm::mat4 modelViewProjection;
     uint32_t vertexStride;
     uint32_t indexCount;
     uint32_t vertexCount;
+};
+
+struct TriangleFilteringPushConstantsCascadeShadows
+{
+    VkDeviceAddress indexBuffer;
+    VkDeviceAddress vertexBuffer;
+    VkDeviceAddress filteredBuffers[MAX_SHADOW_CASCADES];
+    VkDeviceAddress drawCommands[MAX_SHADOW_CASCADES];
+    alignas(16) glm::mat4 modelViewProjection;
+    uint32_t vertexStride;
+    uint32_t indexCount;
+    uint32_t vertexCount;
+};
+
+
+struct ShadowDepthPushConstants
+{
+    uint32_t cascadeIndex;
 };
 
 struct PointLightPushConstants
@@ -393,10 +421,15 @@ VkSemaphore renderFinishedSemaphores[FRAMES_IN_FLIGHT];
 // Triangle Filtering
 
 VkPipeline gTFilteringPipeline;
+VkPipeline gTFilteringPipelineCascadeShadowMapping;
+VkPipeline shadowDepthPipeline;
+
 Shader            *gTFilteringShaders = nullptr;
 VkPipelineLayout  pipelineLayout;
 Buffer*           gTFilteredTriangles;
 Buffer*           gTFilterIndirectArgs;
+
+
 // GBuffer
 VkPipeline gBufferPipeline;
 VkRenderingInfo gBufferRenderInfo;
@@ -408,6 +441,10 @@ RenderTarget *gDepthBufferRT;
 
 Shader *ssaoShader = nullptr;
 Shader *ssaoBlurShader = nullptr;
+Shader *shadowDepthShader = nullptr;
+
+Buffer*           gTFilteredTrianglesCascadeShadows[MAX_SHADOW_CASCADES];
+Buffer*           gTFilterIndirectArgsCascadeShadows[MAX_SHADOW_CASCADES];
 
 RenderTarget *ssaoBlurRT;
 RenderTarget *ssaoRT;
@@ -432,7 +469,8 @@ glm::mat4 view = glm::lookAt(eye, target, up);
 
 // compute
 
-Shader *shaderComputerFiltering = nullptr;
+Shader *shaderComputerFiltering             = nullptr;
+Shader *shaderCascadeShadowMappingFiltering = nullptr;
 
 class VulkanglTFModel
 {
@@ -1361,7 +1399,7 @@ public:
         }
 
         if (SkyLightsDataBuffer[frameIndex])
-        {
+    {
             mapBuffer(device, SkyLightsDataBuffer[frameIndex], &SkyLightUniformData);
         }
     }
@@ -1725,20 +1763,20 @@ public:
             perFrameBinding[0].binding = 0;
             perFrameBinding[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             perFrameBinding[0].descriptorCount = 1;
-            perFrameBinding[0].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+            perFrameBinding[0].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
             perFrameBinding[0].pImmutableSamplers = nullptr;
 
             // binding 1 — shadow generation data
             perFrameBinding[1].binding = 1;
             perFrameBinding[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             perFrameBinding[1].descriptorCount = 1;
-            perFrameBinding[1].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+            perFrameBinding[1].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
             perFrameBinding[1].pImmutableSamplers = nullptr;
 
             perFrameBinding[2].binding = 2;
             perFrameBinding[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             perFrameBinding[2].descriptorCount = 1;
-            perFrameBinding[2].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+            perFrameBinding[2].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
             perFrameBinding[2].pImmutableSamplers = nullptr;
 
             VkDescriptorSetLayoutCreateInfo lPerFrameDesc = {};
@@ -1854,8 +1892,11 @@ public:
 
         VkPushConstantRange pushConstantRanges[1];
         pushConstantRanges->offset = 0;
-        pushConstantRanges->size = std::max(sizeof(TriangleFilteringPushConstants), sizeof(ComposePushConstants));
-        pushConstantRanges->stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        pushConstantRanges->size = std::max(sizeof(ComposePushConstants), sizeof(TriangleFilteringPushConstantsCascadeShadows));
+        
+        pushConstantRanges->stageFlags = VK_SHADER_STAGE_COMPUTE_BIT |
+                                         VK_SHADER_STAGE_VERTEX_BIT |
+                                         VK_SHADER_STAGE_FRAGMENT_BIT;
 
         VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
         pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -2645,6 +2686,13 @@ public:
         {
             mapBuffer(device, gTFilterIndirectArgs, &filteringDrawCommand);
         }
+        for (int32_t cascade_index = 0; cascade_index < MAX_SHADOW_CASCADES; ++cascade_index)
+        {
+            if (gTFilterIndirectArgsCascadeShadows[cascade_index])
+            {
+                mapBuffer(device, gTFilterIndirectArgsCascadeShadows[cascade_index], &filteringDrawCommand);
+            }
+        }
 
         Update(frameIndex);
         
@@ -2738,23 +2786,111 @@ public:
 
         VkRect2D scissor = {};
         scissor.extent = {gAppSettings->width, gAppSettings->height};
+      
+        auto getBufferAddress = [this](VkBuffer buffer)
+        {
+            VkBufferDeviceAddressInfo addressInfo = {};
+            addressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+            addressInfo.buffer = buffer;
+            return vkGetBufferDeviceAddress(device, &addressInfo);
+        };
+        
+        // compute cascade triangle filtering
+        {
+
+            TriangleFilteringPushConstantsCascadeShadows filteringPushConstants = {};
+            filteringPushConstants.indexBuffer = getBufferAddress(model_gltf.indexBufferVk->buffer);
+            filteringPushConstants.vertexBuffer = getBufferAddress(model_gltf.vertexBufferVk->buffer);
+            
+            bool hasCascadeShadowFilteringBuffers = true;
+            for (int32_t cascade_index = 0; cascade_index < MAX_SHADOW_CASCADES; ++cascade_index)
+            {
+                if (gTFilteredTrianglesCascadeShadows[cascade_index])
+                {
+                    filteringPushConstants.filteredBuffers[cascade_index] =
+                        getBufferAddress(gTFilteredTrianglesCascadeShadows[cascade_index]->buffer);
+                }
+                else
+                {
+                    hasCascadeShadowFilteringBuffers = false;
+                }
+
+                if (gTFilterIndirectArgsCascadeShadows[cascade_index])
+                {
+                    filteringPushConstants.drawCommands[cascade_index] =
+                        getBufferAddress(gTFilterIndirectArgsCascadeShadows[cascade_index]->buffer);
+                }
+                else
+                {
+                    hasCascadeShadowFilteringBuffers = false;
+                }
+            }            
+
+         
+            filteringPushConstants.modelViewProjection = UniformData.proj * UniformData.view * UniformData.model;
+            filteringPushConstants.vertexStride = sizeof(VulkanglTFModel::Vertex);
+            filteringPushConstants.indexCount = model_gltf.indextotalCount;
+            filteringPushConstants.vertexCount = model_gltf.vertextotalCount;
+
+            constexpr uint32_t filteringThreadGroupSize = 256;
+            const uint32_t triangleCount = (model_gltf.indextotalCount + 2) / 3;
+            const uint32_t groupCount = (triangleCount + filteringThreadGroupSize - 1) / filteringThreadGroupSize;
+
+            if (gTFilteringPipelineCascadeShadowMapping && hasCascadeShadowFilteringBuffers && groupCount > 0)
+            {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gTFilteringPipelineCascadeShadowMapping);
+                vkCmdPushConstants(cmd,
+                                   pipelineLayout,
+                                   VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT ,
+                                   0,
+                                   sizeof(TriangleFilteringPushConstantsCascadeShadows),
+                                   &filteringPushConstants);
+                
+                vkCmdDispatch(cmd, groupCount, 1, 1);
+
+                VkBufferMemoryBarrier filterBarriers[MAX_SHADOW_CASCADES * 2] = {};
+                for (int32_t cascade_index = 0; cascade_index < MAX_SHADOW_CASCADES; ++cascade_index)
+                {
+                    const uint32_t filteredBufferBarrierIndex = cascade_index * 2;
+                    const uint32_t drawCommandBarrierIndex = filteredBufferBarrierIndex + 1;
+
+                    filterBarriers[filteredBufferBarrierIndex].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                    filterBarriers[filteredBufferBarrierIndex].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    filterBarriers[filteredBufferBarrierIndex].dstAccessMask = VK_ACCESS_INDEX_READ_BIT;
+                    filterBarriers[filteredBufferBarrierIndex].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    filterBarriers[filteredBufferBarrierIndex].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    filterBarriers[filteredBufferBarrierIndex].buffer = gTFilteredTrianglesCascadeShadows[cascade_index]->buffer;
+                    filterBarriers[filteredBufferBarrierIndex].offset = 0;
+                    filterBarriers[filteredBufferBarrierIndex].size = gTFilteredTrianglesCascadeShadows[cascade_index]->size;
+
+                    filterBarriers[drawCommandBarrierIndex].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                    filterBarriers[drawCommandBarrierIndex].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    filterBarriers[drawCommandBarrierIndex].dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+                    filterBarriers[drawCommandBarrierIndex].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    filterBarriers[drawCommandBarrierIndex].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    filterBarriers[drawCommandBarrierIndex].buffer = gTFilterIndirectArgsCascadeShadows[cascade_index]->buffer;
+                    filterBarriers[drawCommandBarrierIndex].offset = 0;
+                    filterBarriers[drawCommandBarrierIndex].size = gTFilterIndirectArgsCascadeShadows[cascade_index]->size;
+                }
+
+                vkCmdPipelineBarrier(cmd,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                                     0, 0, nullptr, MAX_SHADOW_CASCADES * 2, filterBarriers, 0, nullptr);
+            }
+        }
 
         // compute triangle filtering
         {
-            auto getBufferAddress = [this](VkBuffer buffer)
-            {
-                VkBufferDeviceAddressInfo addressInfo = {};
-                addressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
-                addressInfo.buffer = buffer;
-                return vkGetBufferDeviceAddress(device, &addressInfo);
-            };
 
             TriangleFilteringPushConstants filteringPushConstants = {};
+            
             filteringPushConstants.indexBuffer = getBufferAddress(model_gltf.indexBufferVk->buffer);
             filteringPushConstants.vertexBuffer = getBufferAddress(model_gltf.vertexBufferVk->buffer);
+            
             if (gTFilteredTriangles)
             {
-                filteringPushConstants.filteredBuffers[0] = getBufferAddress(gTFilteredTriangles->buffer);
+                filteringPushConstants.filteredBuffers = getBufferAddress(gTFilteredTriangles->buffer);
             }
             if (gTFilterIndirectArgs)
             {
@@ -2774,10 +2910,11 @@ public:
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gTFilteringPipeline);
                 vkCmdPushConstants(cmd,
                                    pipelineLayout,
-                                   VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT ,
                                    0,
                                    sizeof(TriangleFilteringPushConstants),
                                    &filteringPushConstants);
+                
                 vkCmdDispatch(cmd, groupCount, 1, 1);
 
                 VkBufferMemoryBarrier filterBarriers[2] = {};
@@ -2803,6 +2940,128 @@ public:
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                      VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                                      0, 0, nullptr, 2, filterBarriers, 0, nullptr);
+            }
+        }
+        
+
+        // Drawing cascade shadows 
+        {
+            if (shadowDepthPipeline && hasShadowRenderTargets())
+            {
+                RenderTarget *shadowDepth = gShadowRenderTargets.cascadeDepth;
+
+                VkPipelineStageFlags shadowDepthSrcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+                VkAccessFlags shadowDepthSrcAccess = 0;
+                if (shadowDepth->currentLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                {
+                    shadowDepthSrcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+                    shadowDepthSrcAccess = VK_ACCESS_SHADER_READ_BIT;
+                }
+                else if (shadowDepth->currentLayout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL)
+                {
+                    shadowDepthSrcStage = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+                    shadowDepthSrcAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                }
+
+                VkImageMemoryBarrier shadowDepthToAttachment = {};
+                shadowDepthToAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                shadowDepthToAttachment.oldLayout = shadowDepth->currentLayout;
+                shadowDepthToAttachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+                shadowDepthToAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                shadowDepthToAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                shadowDepthToAttachment.image = shadowDepth->image;
+                shadowDepthToAttachment.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, MAX_SHADOW_CASCADES};
+                shadowDepthToAttachment.srcAccessMask = shadowDepthSrcAccess;
+                shadowDepthToAttachment.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+                vkCmdPipelineBarrier(cmd,
+                                     shadowDepthSrcStage,
+                                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                     0, 0, nullptr, 0, nullptr, 1, &shadowDepthToAttachment);
+                shadowDepth->currentLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+
+                VkViewport shadowViewport = {};
+                shadowViewport.width = static_cast<float>(SHADOW_MAP_SIZE);
+                shadowViewport.height = static_cast<float>(SHADOW_MAP_SIZE);
+                shadowViewport.minDepth = 0.0f;
+                shadowViewport.maxDepth = 1.0f;
+
+                VkRect2D shadowScissor = {};
+                shadowScissor.extent = {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE};
+
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowDepthPipeline);
+                VkDescriptorSet shadowSets[2] = {setsPersistent, setsPerFrame[frameIndex]};
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 2, shadowSets, 0, nullptr);
+                VkDeviceSize shadowVertexOffset = 0;
+                vkCmdBindVertexBuffers(cmd, 0, 1, &model_gltf.vertexBufferVk->buffer, &shadowVertexOffset);
+
+                for (uint32_t cascadeIndex = 0; cascadeIndex < MAX_SHADOW_CASCADES; ++cascadeIndex)
+                {
+                    VkRenderingAttachmentInfo shadowDepthAttachment = {};
+                    shadowDepthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                    shadowDepthAttachment.imageView = gShadowRenderTargets.cascadeLayerViews[cascadeIndex];
+                    shadowDepthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+                    shadowDepthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    shadowDepthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                    shadowDepthAttachment.clearValue = shadowDepth->clearValue;
+
+                    VkRenderingInfo shadowRenderingInfo = {};
+                    shadowRenderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+                    shadowRenderingInfo.renderArea = {{0, 0}, {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE}};
+                    shadowRenderingInfo.layerCount = 1;
+                    shadowRenderingInfo.colorAttachmentCount = 0;
+                    shadowRenderingInfo.pDepthAttachment = &shadowDepthAttachment;
+
+                    vkCmdBeginRendering(cmd, &shadowRenderingInfo);
+                    vkCmdSetViewport(cmd, 0, 1, &shadowViewport);
+                    vkCmdSetScissor(cmd, 0, 1, &shadowScissor);
+
+                    ShadowDepthPushConstants shadowPushConstants = {};
+                    shadowPushConstants.cascadeIndex = cascadeIndex;
+                    vkCmdPushConstants(cmd,
+                                       pipelineLayout,
+                                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT , 
+                                       0,
+                                       sizeof(ShadowDepthPushConstants),
+                                       &shadowPushConstants);
+
+                    if (gTFilteredTrianglesCascadeShadows[cascadeIndex] && gTFilterIndirectArgsCascadeShadows[cascadeIndex])
+                    {
+                        vkCmdBindIndexBuffer(cmd,
+                                             gTFilteredTrianglesCascadeShadows[cascadeIndex]->buffer,
+                                             0,
+                                             VK_INDEX_TYPE_UINT32);
+                        vkCmdDrawIndexedIndirect(cmd,
+                                                 gTFilterIndirectArgsCascadeShadows[cascadeIndex]->buffer,
+                                                 0,
+                                                 1,
+                                                 sizeof(VkDrawIndexedIndirectCommand));
+                    }
+                    else
+                    {
+                        vkCmdBindIndexBuffer(cmd, model_gltf.indexBufferVk->buffer, 0, VK_INDEX_TYPE_UINT32);
+                        vkCmdDrawIndexed(cmd, model_gltf.indextotalCount, 1, 0, 0, 0);
+                    }
+
+                    vkCmdEndRendering(cmd);
+                }
+
+                VkImageMemoryBarrier shadowDepthToSample = {};
+                shadowDepthToSample.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                shadowDepthToSample.oldLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+                shadowDepthToSample.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                shadowDepthToSample.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                shadowDepthToSample.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                shadowDepthToSample.image = shadowDepth->image;
+                shadowDepthToSample.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, MAX_SHADOW_CASCADES};
+                shadowDepthToSample.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                shadowDepthToSample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+                vkCmdPipelineBarrier(cmd,
+                                     VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                     0, 0, nullptr, 0, nullptr, 1, &shadowDepthToSample);
+                shadowDepth->currentLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             }
         }
 
@@ -3129,6 +3388,27 @@ public:
             shaderModuleDesc.codeSize = 4 * GBufferFragCode.size();
             VK_CHECK(vkCreateShaderModule(device, &shaderModuleDesc, nullptr, &gBufferShader->frag));
         }
+        // Shadow depth shaders
+        {
+            shadowDepthShader = new Shader();
+
+            std::vector<uint32_t> shadowDepthVertCode = LoadShaderCode("shaders/shadow_depth.vert.spv");
+            std::vector<uint32_t> shadowDepthFragCode = LoadShaderCode("shaders/shadow_depth.frag.spv");
+
+            assert(shadowDepthVertCode.size() != 0);
+            assert(shadowDepthFragCode.size() != 0);
+
+            VkShaderModuleCreateInfo shaderModuleDesc = {};
+            shaderModuleDesc.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            shaderModuleDesc.pCode = reinterpret_cast<const uint32_t *>(shadowDepthVertCode.data());
+            shaderModuleDesc.codeSize = shadowDepthVertCode.size() * 4;
+
+            VK_CHECK(vkCreateShaderModule(device, &shaderModuleDesc, nullptr, &shadowDepthShader->vert));
+
+            shaderModuleDesc.pCode = reinterpret_cast<const uint32_t *>(shadowDepthFragCode.data());
+            shaderModuleDesc.codeSize = shadowDepthFragCode.size() * 4;
+            VK_CHECK(vkCreateShaderModule(device, &shaderModuleDesc, nullptr, &shadowDepthShader->frag));
+        }
         // SSAO Shader 
         {
             ssaoShader = new Shader();
@@ -3196,8 +3476,25 @@ public:
 
             VK_CHECK(vkCreateShaderModule(device, &shaderModuleDesc, nullptr, &shaderComputerFiltering->comp));
 
+        }
+
+        // Compute and Filtering Shaders: Cascade shadow mapping  
+        {
+
+            shaderCascadeShadowMappingFiltering = new Shader();
+
+            auto triangleFilteringShadersCascadeMapping = LoadShaderCode("shaders/filtering_cascade.comp.spv");
+            assert(triangleFilteringShadersCascadeMapping.size() != 0);
+
+            VkShaderModuleCreateInfo    shaderModuleDesc = {};
+            shaderModuleDesc.sType      = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            shaderModuleDesc.pCode      = reinterpret_cast<const uint32_t *>(triangleFilteringShadersCascadeMapping.data());
+            shaderModuleDesc.codeSize   = triangleFilteringShadersCascadeMapping.size() * 4;
+
+            VK_CHECK(vkCreateShaderModule(device, &shaderModuleDesc, nullptr, &shaderCascadeShadowMappingFiltering->comp));
+
         } 
-    
+     
     }
     
     void addPipelines()
@@ -3270,7 +3567,6 @@ public:
             VkPipelineRenderingCreateInfo renderingInfo = {};
             renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
             renderingInfo.colorAttachmentCount = 2;
-            VkFormat colorsAttachments[2] = {gBufferNormalSpecularRT->format, gBufferAlbedoRT->format};
 
             VkComputePipelineCreateInfo computeDesc{};
             computeDesc.layout = pipelineLayout;
@@ -3285,6 +3581,42 @@ public:
             VK_CHECK(vkCreateComputePipelines(device, nullptr, 1, &computeDesc, nullptr, &gTFilteringPipeline));       
 
         }
+
+        // Cascade shadow mapping: triangle filtering pipeline  
+        if (shaderCascadeShadowMappingFiltering)
+        {
+            VkPipelineShaderStageCreateInfo shaderStageDesc{};
+            
+            // Comp stage
+            shaderStageDesc.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            shaderStageDesc.pNext = nullptr;
+            shaderStageDesc.flags = 0;
+            shaderStageDesc.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            shaderStageDesc.module = shaderCascadeShadowMappingFiltering->comp;
+            shaderStageDesc.pName = "main";
+            shaderStageDesc.pSpecializationInfo = nullptr;
+
+            // dynamic rendering stage
+            VkPipelineRenderingCreateInfo renderingInfo = {};
+            renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+            renderingInfo.colorAttachmentCount = 2;
+            
+            VkComputePipelineCreateInfo computeDesc{};
+            computeDesc.layout = pipelineLayout;
+            computeDesc.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            
+            VkPipelineShaderStageCreateInfo shaderComputeStageCreateInfo{}; 
+            shaderComputeStageCreateInfo.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            shaderComputeStageCreateInfo.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+            shaderComputeStageCreateInfo.module = shaderCascadeShadowMappingFiltering->comp;
+            shaderComputeStageCreateInfo.pName  = "main";
+            
+            computeDesc.stage =  shaderComputeStageCreateInfo;
+            
+            VK_CHECK(vkCreateComputePipelines(device, nullptr, 1, &computeDesc, nullptr, &gTFilteringPipelineCascadeShadowMapping));       
+
+        }
+
 
         // GBuffer Pipeline
         {
@@ -3392,21 +3724,23 @@ public:
             dynamicState.pDynamicStates = dynamicStates;
 
             /*
-                            typedef struct VkPipelineRasterizationStateCreateInfo {
-                VkStructureType                            sType;
-                const void*                                pNext;
-                VkPipelineRasterizationStateCreateFlags    flags;
-                VkBool32                                   depthClampEnable;
-                VkBool32                                   rasterizerDiscardEnable;
-                VkPolygonMode                              polygonMode;
-                VkCullModeFlags                            cullMode;
-                VkFrontFace                                frontFace;
-                VkBool32                                   depthBiasEnable;
-                float                                      depthBiasConstantFactor;
-                float                                      depthBiasClamp;
-                float                                      depthBiasSlopeFactor;
-                float                                      lineWidth;
-            } VkPipelineRasterizationStateCreateInfo;
+            
+                typedef struct VkPipelineRasterizationStateCreateInfo {
+                    VkStructureType                            sType;
+                    const void*                                pNext;
+                    VkPipelineRasterizationStateCreateFlags    flags;
+                    VkBool32                                   depthClampEnable;
+                    VkBool32                                   rasterizerDiscardEnable;
+                    VkPolygonMode                              polygonMode;
+                    VkCullModeFlags                            cullMode;
+                    VkFrontFace                                frontFace;
+                    VkBool32                                   depthBiasEnable;
+                    float                                      depthBiasConstantFactor;
+                    float                                      depthBiasClamp;
+                    float                                      depthBiasSlopeFactor;
+                    float                                      lineWidth;
+                } VkPipelineRasterizationStateCreateInfo;
+           
             */
 
             VkPipelineColorBlendAttachmentState blendAttachments[2] = {};
@@ -3442,6 +3776,120 @@ public:
             gBufferPipelineDesc.flags = 0;
 
             VK_CHECK(vkCreateGraphicsPipelines(device, nullptr, 1, &gBufferPipelineDesc, nullptr, &gBufferPipeline));
+        }
+
+        // Shadow depth pipeline
+        if (shadowDepthShader)
+        {
+            VkPipelineDepthStencilStateCreateInfo depthStencilState = {};
+            depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+            depthStencilState.depthTestEnable = VK_TRUE;
+            depthStencilState.depthWriteEnable = VK_TRUE;
+            depthStencilState.depthCompareOp = VK_COMPARE_OP_LESS;
+            depthStencilState.depthBoundsTestEnable = VK_FALSE;
+            depthStencilState.stencilTestEnable = VK_FALSE;
+            depthStencilState.minDepthBounds = 0.0f;
+            depthStencilState.maxDepthBounds = 1.0f;
+
+            VkPipelineViewportStateCreateInfo viewportState = {};
+            viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+            viewportState.viewportCount = 1;
+            viewportState.pViewports = nullptr;
+            viewportState.scissorCount = 1;
+            viewportState.pScissors = nullptr;
+
+            VkVertexInputBindingDescription bindingDescription = {};
+            bindingDescription.binding = 0;
+            bindingDescription.stride = sizeof(VulkanglTFModel::Vertex);
+            bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+            VkVertexInputAttributeDescription attributeDescriptions[4] = {};
+            attributeDescriptions[0].binding = 0;
+            attributeDescriptions[0].location = 0;
+            attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+            attributeDescriptions[0].offset = offsetof(VulkanglTFModel::Vertex, pos);
+
+            attributeDescriptions[1].binding = 0;
+            attributeDescriptions[1].location = 1;
+            attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+            attributeDescriptions[1].offset = offsetof(VulkanglTFModel::Vertex, normal);
+
+            attributeDescriptions[2].binding = 0;
+            attributeDescriptions[2].location = 2;
+            attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
+            attributeDescriptions[2].offset = offsetof(VulkanglTFModel::Vertex, uv);
+
+            attributeDescriptions[3].binding = 0;
+            attributeDescriptions[3].location = 3;
+            attributeDescriptions[3].format = VK_FORMAT_R32_UINT;
+            attributeDescriptions[3].offset = offsetof(VulkanglTFModel::Vertex, textureIndex);
+
+            VkPipelineVertexInputStateCreateInfo vertexInputInfo = {};
+            vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+            vertexInputInfo.vertexBindingDescriptionCount = 1;
+            vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
+            vertexInputInfo.vertexAttributeDescriptionCount = 4;
+            vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions;
+
+            VkPipelineInputAssemblyStateCreateInfo inputAssemblyState = {};
+            inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+            inputAssemblyState.primitiveRestartEnable = VK_FALSE;
+            inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+            VkPipelineShaderStageCreateInfo shaderStageDesc[2] = {};
+            shaderStageDesc[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            shaderStageDesc[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            shaderStageDesc[0].module = shadowDepthShader->vert;
+            shaderStageDesc[0].pName = "main";
+
+            shaderStageDesc[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            shaderStageDesc[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            shaderStageDesc[1].module = shadowDepthShader->frag;
+            shaderStageDesc[1].pName = "main";
+
+            VkPipelineRenderingCreateInfo renderingInfo = {};
+            renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+            renderingInfo.colorAttachmentCount = 0;
+            renderingInfo.pColorAttachmentFormats = nullptr;
+            renderingInfo.depthAttachmentFormat = gShadowRenderTargets.cascadeDepth->format;
+            renderingInfo.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+
+            VkDynamicState dynamicStates[] = {
+                VK_DYNAMIC_STATE_VIEWPORT,
+                VK_DYNAMIC_STATE_SCISSOR};
+
+            VkPipelineDynamicStateCreateInfo dynamicState = {};
+            dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+            dynamicState.dynamicStateCount = static_cast<uint32_t>(std::size(dynamicStates));
+            dynamicState.pDynamicStates = dynamicStates;
+
+            VkPipelineRasterizationStateCreateInfo rasterizationState = pRasterizationState;
+            rasterizationState.cullMode = VK_CULL_MODE_BACK_BIT;
+            rasterizationState.depthBiasEnable = VK_FALSE;
+
+            VkPipelineColorBlendStateCreateInfo colorBlendState = {};
+            colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+            colorBlendState.attachmentCount = 0;
+            colorBlendState.pAttachments = nullptr;
+
+            VkGraphicsPipelineCreateInfo shadowDepthPipelineDesc = {};
+            shadowDepthPipelineDesc.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            shadowDepthPipelineDesc.pNext = &renderingInfo;
+            shadowDepthPipelineDesc.stageCount = 2;
+            shadowDepthPipelineDesc.pStages = shaderStageDesc;
+            shadowDepthPipelineDesc.pVertexInputState = &vertexInputInfo;
+            shadowDepthPipelineDesc.pInputAssemblyState = &inputAssemblyState;
+            shadowDepthPipelineDesc.pViewportState = &viewportState;
+            shadowDepthPipelineDesc.pRasterizationState = &rasterizationState;
+            shadowDepthPipelineDesc.pMultisampleState = &multisampleState;
+            shadowDepthPipelineDesc.pDepthStencilState = &depthStencilState;
+            shadowDepthPipelineDesc.pColorBlendState = &colorBlendState;
+            shadowDepthPipelineDesc.pDynamicState = &dynamicState;
+            shadowDepthPipelineDesc.layout = pipelineLayout;
+            shadowDepthPipelineDesc.renderPass = VK_NULL_HANDLE;
+            shadowDepthPipelineDesc.subpass = 0;
+
+            VK_CHECK(vkCreateGraphicsPipelines(device, nullptr, 1, &shadowDepthPipelineDesc, nullptr, &shadowDepthPipeline));
         }
 
         // SSAO Pipleine Blur and Compute
@@ -3848,6 +4296,7 @@ public:
     void VulkanInit()
     {
         VkApplicationInfo appInfo{};
+        
         // Debug messenger
         VkDebugUtilsMessengerEXT debugMessenger;
         VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo{};
