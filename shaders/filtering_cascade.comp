@@ -8,38 +8,79 @@
 
 #include "config.h"
 
-#define NUM_CASCADE_SHADOW_MAPS 1 
+#define NUM_CASCADE_SHADOW_MAPS MAX_SHADOW_CASCADES 
 
 shared uint workGroupOutputSlot[NUM_CASCADE_SHADOW_MAPS];
-shared uint workGroupIndexCount[NUM_CASCADE_SHADOW_MAPS];
-
-//shared FilterDispatchGroupData filterDispatchGroupData;   
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer IndexBuffer {
     uint indices[];
 };
-
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer VertexBuffer {
     float data[];
 };
-
 layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer FilteredIndexBuffer {
     uint indices[];
 };
 
-layout(buffer_reference, std430, buffer_reference_align = 4) buffer FilterDrawCommand {
+layout(set = 1, binding = 0) uniform Ubo {
+    mat4 projection;
+    mat4 model;
+    mat4 view;
+    vec3 cameraPos;
+    float nearPlane;
+    float farPlane;
+} ubo;
+
+/*
+    structure desc:
+
+    struct ShadowCascadeData {
+        mat4 viewProj;
+        float splitDepth;
+    };    
+   
+    struct ShadowGenerationUniform {
+        ShadowCascadeData cascades[MAX_SHADOW_CASCADES];
+        vec4 lightDirection;
+        vec4 shadowMapSizeCascadeCount;
+        vec4 bias;
+    };
+
+*/
+
+layout(set = 1, binding = 1) uniform ShadowsData {
+    ShadowGenerationUniform shadow;
+} shadowsData;
+
+/*
+    structure desc:
+
+    struct SkyLightUniform {
+        vec3 lightDirection;
+        vec3 lightColor;
+        float lightIntensity;
+    };
+
+*/
+
+layout(set = 1, binding = 2) uniform LightsData {
+    SkyLightUniform skyLight;
+} lightsData;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer FilterDrawCommand {
     uint indexCount;
     uint instanceCount;
     uint firstIndex;
     int  vertexOffset;
     uint firstInstance;
-};
+} ;
 
 layout(push_constant) uniform PushConstants {
     IndexBuffer          indexBuffer;
     VertexBuffer         vertexBuffer;
-    FilteredIndexBuffer  filteredBuffers[4]; 
-    FilterDrawCommand    drawCommand;
+    FilteredIndexBuffer  filteredBuffers[MAX_SHADOW_CASCADES]; 
+    FilterDrawCommand    drawCommands[MAX_SHADOW_CASCADES];
+    mat4                 modelViewProjection;
     uint                 vertexStride;        
     uint                 indexCount;
     uint                 vertexCount;
@@ -79,7 +120,7 @@ bool trianglePassesFrustum(vec4 p0, vec4 p1, vec4 p2)
     return true;
 }
 
-void main()
+void generateIndexBufferFromCameraView(mat4 CameraView, int current_cascade_index) 
 {
     // Each invocation owns one source triangle.
     uint triangleId = gl_GlobalInvocationID.x;
@@ -106,19 +147,29 @@ void main()
     vec3 v2 = readPosition(i2);
 
     // Transform to clip space so this pass can reject triangles outside the camera frustum.
-    vec4 p0 = pc.modelViewProjection * vec4(v0, 1.0);
-    vec4 p1 = pc.modelViewProjection * vec4(v1, 1.0);
-    vec4 p2 = pc.modelViewProjection * vec4(v2, 1.0);
+    vec4 p0 = CameraView * vec4(v0, 1.0);
+    vec4 p1 = CameraView * vec4(v1, 1.0);
+    vec4 p2 = CameraView * vec4(v2, 1.0);
 
     if (!trianglePassesFrustum(p0, p1, p2)) {
         return;
     }
 
     // Reserve three compacted output indices and grow the indirect draw's indexCount.
-    uint outputBase = atomicAdd(pc.drawCommand.indexCount, 3);
+    uint outputBase = atomicAdd(pc.drawCommands[current_cascade_index].indexCount, 3);
 
     // Write the surviving triangle into the filtered index buffer used by the GBuffer draw.
-    pc.filteredBuffers[0].indices[outputBase + 0] = i0;
-    pc.filteredBuffers[0].indices[outputBase + 1] = i1;
-    pc.filteredBuffers[0].indices[outputBase + 2] = i2;
+    pc.filteredBuffers[current_cascade_index].indices[outputBase + 0] = i0;
+    pc.filteredBuffers[current_cascade_index].indices[outputBase + 1] = i1;
+    pc.filteredBuffers[current_cascade_index].indices[outputBase + 2] = i2;
+}
+
+void main()
+{
+
+    for (int cascade_index = 0; cascade_index < NUM_CASCADE_SHADOW_MAPS; cascade_index++)
+    {
+        mat4 cascadeModelViewProjection = shadowsData.shadow.cascades[cascade_index].viewProj * ubo.model;
+        generateIndexBufferFromCameraView(cascadeModelViewProjection, cascade_index);
+    } 
 }

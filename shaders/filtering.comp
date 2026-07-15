@@ -35,7 +35,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer FilterDrawCo
 layout(push_constant) uniform PushConstants {
     IndexBuffer          indexBuffer;
     VertexBuffer         vertexBuffer;
-    FilteredIndexBuffer  filteredBuffers[4]; 
+    FilteredIndexBuffer  filteredBuffers; 
     FilterDrawCommand    drawCommand;
     mat4                 modelViewProjection;
     uint                 vertexStride;        
@@ -116,7 +116,7 @@ void main()
     uint outputBase = atomicAdd(pc.drawCommand.indexCount, 3);
 
     // Write the surviving triangle into the filtered index buffer used by the GBuffer draw.
-    pc.filteredBuffers[0].indices[outputBase + 0] = i0;
-    pc.filteredBuffers[0].indices[outputBase + 1] = i1;
-    pc.filteredBuffers[0].indices[outputBase + 2] = i2;
+    pc.filteredBuffers.indices[outputBase + 0] = i0;
+    pc.filteredBuffers.indices[outputBase + 1] = i1;
+    pc.filteredBuffers.indices[outputBase + 2] = i2;
 }
