@@ -158,7 +158,7 @@ struct SkyLightUniform
 SkyLightUniform SkyLightUniformData;
 ShadowGenerationUniform ShadowGenUniformData;
 
-constexpr uint32_t PERSISTENT_BINDING_COUNT = 12;
+constexpr uint32_t PERSISTENT_BINDING_COUNT = 13;
 constexpr uint32_t PER_FRAME_BINDING_COUNT = 3;
 constexpr uint32_t FRAMES_IN_FLIGHT = 2;
 
@@ -437,7 +437,9 @@ Shader *gBufferShader = nullptr;
 RenderTarget *gBufferNormalSpecularRT;
 RenderTarget *gBufferAlbedoRT;
 RenderTarget *gDepthBufferRT;
+
 // SSAO
+RenderTarget *composeImagePostProcessingRT;
 
 Shader *ssaoShader = nullptr;
 Shader *ssaoBlurShader = nullptr;
@@ -1874,8 +1876,14 @@ public:
             persistentBinding[11].descriptorCount = 1;
             persistentBinding[11].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
             persistentBinding[11].pImmutableSamplers = nullptr;
+            
+            // Compose image state -> used for post processing techniques 
+            persistentBinding[12].binding = 12;
+            persistentBinding[12].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            persistentBinding[12].descriptorCount = 1;
+            persistentBinding[12].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+            persistentBinding[12].pImmutableSamplers = nullptr;
 
-           
             VkDescriptorSetLayoutCreateInfo lPersistentDesc = {};
             lPersistentDesc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
             lPersistentDesc.pNext = nullptr;
@@ -2158,6 +2166,17 @@ public:
         writePersistent[11].descriptorCount = 1;
         writePersistent[11].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         writePersistent[11].pImageInfo = &gShadowRenderTargets.cascadeDepth->imageInfo;
+ 
+        // Shadow cascade depth RT
+        writePersistent[12].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writePersistent[12].pNext = nullptr;
+        writePersistent[12].dstSet = setsPersistent;
+        writePersistent[12].dstBinding = 12;
+        writePersistent[12].dstArrayElement = 0;
+        writePersistent[12].descriptorCount = 1;
+        writePersistent[12].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writePersistent[12].pImageInfo = &composeImagePostProcessingRT->imageInfo;
+
 
         vkUpdateDescriptorSets(device,
                                 PERSISTENT_BINDING_COUNT,
@@ -2541,6 +2560,21 @@ public:
                     depthDesc.pName = "DepthBuffer";
                     addRenderTarget(device, physicalDevice, &depthDesc, &gDepthBufferRT);
                 }
+         
+         
+               {
+                    RenderTargetDesc composeImageDesc{};
+                    composeImageDesc.width = gAppSettings->width;
+                    composeImageDesc.height = gAppSettings->height;
+                    composeImageDesc.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+                    composeImageDesc.usageFlags = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                    composeImageDesc.clearValue = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}}}; 
+                    composeImageDesc.startLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    composeImageDesc.pName = "DepthBuffer";
+                    addRenderTarget(device, physicalDevice, &composeImageDesc, &composeImagePostProcessingRT);
+                }
+           
+         
             }
 
             // Shadow Render Targets

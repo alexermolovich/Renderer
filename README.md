@@ -10,6 +10,8 @@
 - [x] Per-frame camera/model/view/projection uniform buffers
 - [x] Persistent descriptor set for render targets, samplers, textures, SSAO noise, and SSAO kernels
 - [x] Per-frame descriptor sets for frame uniform data
+- [x] Shadow generation uniform buffer with cascade matrices, split depths, map size, and bias data
+- [x] Persistent descriptor binding for the cascade shadow depth array
 - [x] Sponza glTF scene loading with `tinygltf`
 - [x] glTF image and texture upload path
 - [x] Standalone texture loading with `stb_image`
@@ -32,6 +34,10 @@
 - [x] SSAO output target: `R32_SFLOAT`
 - [x] SSAO blur target allocation
 - [x] SSAO blur compute dispatch path
+- [x] Cascade shadow-map depth target: 4-layer `D32_SFLOAT` array
+- [x] Per-cascade shadow-map image views
+- [x] Shadow depth pass using `shadow_depth.vert` and `shadow_depth.frag`
+- [x] Cascade shadow-map sampling in `compose.frag`
 - [x] Final composition pass using `compose.frag`
 - [x] Swapchain present step
 
@@ -40,7 +46,9 @@
 - [ ] SSAO blur math in `ssao_blur.comp`
 - [x] Triangle filtering runtime pass using `filtering.comp`
 - [x] Filtered triangle buffer used by the draw call
-- [ ] Shadow depth pass
+- [x] Cascade triangle filtering runtime pass using `filtering_cascade.comp`
+- [x] Filtered triangle buffers and indirect draw commands for each shadow cascade
+- [x] Shadow depth pass
 - [ ] Deferred lighting pass
 - [x] Material texture sampling in the G-buffer shader
 
@@ -55,7 +63,8 @@
 - [ ] Runtime LOD selection
 - [ ] Particle system
 - [ ] Particle collision against depth
-- [ ] Shadow map pass
+- [x] Shadow map pass
+- [x] Cascade shadow mapping
 - [ ] Point light shadow cubemaps
 - [ ] Deferred lighting pass
 - [ ] Tiled or clustered lighting
@@ -127,4 +136,3 @@ cmake --build build --target shaders
 cmake --build build --target vkml
 cmake --build build --target clean
 ```
-

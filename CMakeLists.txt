@@ -99,7 +99,7 @@ set(SPIRV_DIR ${CMAKE_BINARY_DIR}/shaders)
 
 file(MAKE_DIRECTORY ${SPIRV_DIR})
 
-file(GLOB SHADERS
+file(GLOB SHADERS CONFIGURE_DEPENDS
     ${SHADER_DIR}/*.vert
     ${SHADER_DIR}/*.frag
     ${SHADER_DIR}/*.comp
