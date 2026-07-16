@@ -7,6 +7,7 @@ layout(set = 0, binding = 0) uniform texture2D depthRT;
 layout(set = 0, binding = 3) uniform texture2D gBufferAlbedoRT;
 layout(set = 0, binding = 6) uniform sampler rtSampler1;
 layout(set = 0, binding = 11) uniform texture2DArray shadowCascadeDepthRT;
+
 layout (location = 0) in vec2 inUV;
 layout (location = 0) out vec4 outColor;
 
@@ -28,12 +29,12 @@ layout(push_constant) uniform PushConstants {
     ComposePushConstants compose;
 } Lights;
 
-vec3 reconstructViewPosition(vec2 uv, float depth)
+vec3 reconstructWorldPosition(vec2 uv, float depth)
 {
-    vec2 ndc = vec2(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0);
+    vec2 ndc = uv * 2.0 - 1.0;
     vec4 clipPosition = vec4(ndc, depth, 1.0);
-    vec4 viewPosition = inverse(ubo.projection) * clipPosition;
-    return viewPosition.xyz / viewPosition.w;
+    vec4 worldPosition = inverse(ubo.projection * ubo.view) * clipPosition;
+    return worldPosition.xyz / worldPosition.w;
 }
 
 uint selectCascade(float viewDepth)
@@ -95,11 +96,11 @@ void main()
     float shadowVisibility = 1.0;
     if (depth < 1.0)
     {
-        vec3 viewPosition = reconstructViewPosition(inUV, depth);
-        vec3 worldPosition = (inverse(ubo.view) * vec4(viewPosition, 1.0)).xyz;
+        vec3 worldPosition = reconstructWorldPosition(inUV, depth);
+        vec3 viewPosition = (ubo.view * vec4(worldPosition, 1.0)).xyz;
         uint cascadeIndex = selectCascade(-viewPosition.z);
         shadowVisibility = sampleCascadeShadow(worldPosition, cascadeIndex);
     }
 
-    outColor = vec4(albedo * (ao * 0.3) * shadowVisibility, 1.0);
+    outColor = vec4(albedo * (ao * 0.1) * shadowVisibility, 1.0);
 }

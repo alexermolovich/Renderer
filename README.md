@@ -12,11 +12,13 @@
 - [x] Per-frame descriptor sets for frame uniform data
 - [x] Shadow generation uniform buffer with cascade matrices, split depths, map size, and bias data
 - [x] Persistent descriptor binding for the cascade shadow depth array
+- [x] Persistent descriptor binding for the composed post-processing image
 - [x] Sponza glTF scene loading with `tinygltf`
 - [x] glTF image and texture upload path
 - [x] Standalone texture loading with `stb_image`
 - [x] Mesh remapping during load with `meshoptimizer`
 - [x] Camera helper in `foundation/`
+- [x] Fly camera movement and arrow-key look controls
 - [x] CMake shader compilation to SPIR-V with `glslc`
 - [x] Double-buffered frame resources
 - [x] Manual image layout transitions for attachment, shader-read, general, and present layouts
@@ -38,8 +40,24 @@
 - [x] Per-cascade shadow-map image views
 - [x] Shadow depth pass using `shadow_depth.vert` and `shadow_depth.frag`
 - [x] Cascade shadow-map sampling in `compose.frag`
+- [x] World-space receiver reconstruction for cascade shadow lookup
+- [x] 3x3 PCF filtering for cascade shadow sampling
 - [x] Final composition pass using `compose.frag`
+- [x] Compose pass output render target for post processing
+- [x] FXAA pass using `fxaa_pass.frag`
+- [x] FXAA pipeline rendering to the swapchain image
 - [x] Swapchain present step
+
+## Current Frame Order
+
+- [x] Cascade shadow triangle filtering compute pass
+- [x] Cascade shadow depth pass
+- [x] G-buffer pass
+- [x] SSAO pass
+- [x] SSAO blur pass dispatch
+- [x] Compose pass into the offscreen compose image
+- [x] FXAA pass from compose image to swapchain image
+- [x] Present swapchain image
 
 ## Active work
 
@@ -51,6 +69,8 @@
 - [x] Shadow depth pass
 - [ ] Deferred lighting pass
 - [x] Material texture sampling in the G-buffer shader
+- [x] Compose-image post-processing target bound through descriptor binding 12
+- [x] Up/down camera movement on `E`/`Q` and `H`/`J`
 
 ## Future Roadmap
 
@@ -72,7 +92,7 @@
 - [ ] Alpha-tested material pass
 - [ ] Transparent material pass
 - [ ] Bilateral SSAO blur
-- [ ] FXAA pass
+- [x] FXAA pass
 - [ ] Temporal anti-aliasing pass
 - [ ] Skybox pass
 - [ ] Image-based lighting
@@ -119,6 +139,14 @@ Run from inside the build directory because the executable loads shaders from `s
 cd build
 ./vkml
 ```
+
+### Controls
+
+- `W` / `S`: move forward and backward
+- `A` / `D`: strafe left and right
+- `E` / `Q`: move up and down
+- `H` / `J`: move up and down
+- Arrow keys: rotate camera yaw and pitch
 
 ### Release Build
 

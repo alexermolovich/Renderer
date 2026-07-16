@@ -1,7 +1,7 @@
 #version 450
 
-const int   SSAO_KERNEL_SIZE = 32;
-const float SSAO_RADIUS      = 0.5;
+const int   SSAO_KERNEL_SIZE = 64;
+const float SSAO_RADIUS      = 0.9;
 
 layout(set = 0, binding = 0) uniform texture2D depthRT;
 layout(set = 0, binding = 1) uniform texture2D ssaoRT;
@@ -91,5 +91,5 @@ void main()
         occlusion += (sampledPos.z <= samplePos.z + bias ? 1.0 : 0.0) * rangeCheck;
     }
 
-    outOcclusion = 1.0 - (occlusion / float(SSAO_KERNEL_SIZE));
+    outOcclusion = 1.0 - (occlusion / float(SSAO_KERNEL_SIZE)) * 0.1;
 }

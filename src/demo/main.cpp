@@ -107,7 +107,7 @@ Camera camera;
 
 float gCameraYaw = -90.0f;
 float gCameraPitch = 0.0f;
-float gCameraMoveSpeed = 8.0f;
+float gCameraMoveSpeed = 20.0f;
 float gCameraTurnSpeed = 80.0f;
 
 VkSemaphore frameSemaphores[COMMAND_BUFFER_COUNT];
@@ -456,6 +456,7 @@ Shader *composeShader = nullptr;
 VkPipeline ssaoPipeline;
 VkPipeline ssaoBlurPipeline;
 VkPipeline composePipeline;
+VkPipeline fxaaPipeline;
 
 VkSwapchainKHR swapchain;
 
@@ -472,7 +473,9 @@ glm::mat4 view = glm::lookAt(eye, target, up);
 // compute
 
 Shader *shaderComputerFiltering             = nullptr;
+
 Shader *shaderCascadeShadowMappingFiltering = nullptr;
+Shader *FxaaPassShader = nullptr;
 
 class VulkanglTFModel
 {
@@ -2549,6 +2552,7 @@ public:
 
                     addRenderTarget(device, physicalDevice, &gSSAOBlurRenderTargetDesc, &ssaoBlurRT);
                 }
+
                 {
                     RenderTargetDesc depthDesc{};
                     depthDesc.width = gAppSettings->width;
@@ -2566,11 +2570,11 @@ public:
                     RenderTargetDesc composeImageDesc{};
                     composeImageDesc.width = gAppSettings->width;
                     composeImageDesc.height = gAppSettings->height;
-                    composeImageDesc.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-                    composeImageDesc.usageFlags = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                    composeImageDesc.format = VK_FORMAT_B8G8R8A8_SRGB;
+                    composeImageDesc.usageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
                     composeImageDesc.clearValue = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}}}; 
                     composeImageDesc.startLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                    composeImageDesc.pName = "DepthBuffer";
+                    composeImageDesc.pName = "ComposeImage";
                     addRenderTarget(device, physicalDevice, &composeImageDesc, &composeImagePostProcessingRT);
                 }
            
@@ -2606,7 +2610,6 @@ public:
     }
     void CreateCommandPool()
     {
-
         VkCommandPoolCreateInfo commandPoolDesc;
         commandPoolDesc.flags = VkCommandPoolCreateFlagBits::VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         commandPoolDesc.pNext = nullptr;
@@ -2668,6 +2671,10 @@ public:
         if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS)
             moveDelta += camera.worldUp * moveAmount;
         if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS)
+            moveDelta -= camera.worldUp * moveAmount;
+        if (glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS)
+            moveDelta += camera.worldUp * moveAmount;
+        if (glfwGetKey(window, GLFW_KEY_J) == GLFW_PRESS)
             moveDelta -= camera.worldUp * moveAmount;
 
         if (glm::length(moveDelta) > 0.0f)
@@ -3298,35 +3305,38 @@ public:
             barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
             barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barriers[1].oldLayout = composeImagePostProcessingRT->currentLayout;
             barriers[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barriers[1].image = swapchainImages[imageIndex];
+            barriers[1].image = composeImagePostProcessingRT->image;
             barriers[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            barriers[1].srcAccessMask = 0;
+            barriers[1].srcAccessMask = composeImagePostProcessingRT->currentLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                         ? VK_ACCESS_SHADER_READ_BIT
+                                         : 0;
             barriers[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
             vkCmdPipelineBarrier(cmd,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                  0, 0, nullptr, 0, nullptr, 2, barriers);
+            composeImagePostProcessingRT->currentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         }
 
-        VkRenderingAttachmentInfo swapchainAttachment = {};
-        swapchainAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        swapchainAttachment.imageView = swapchainImageViews[imageIndex];
-        swapchainAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        swapchainAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        swapchainAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        swapchainAttachment.clearValue = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}}};
+        VkRenderingAttachmentInfo composeAttachment = {};
+        composeAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        composeAttachment.imageView = composeImagePostProcessingRT->imageView;
+        composeAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        composeAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        composeAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        composeAttachment.clearValue = composeImagePostProcessingRT->clearValue;
 
         VkRenderingInfo composeRenderingInfo = {};
         composeRenderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
         composeRenderingInfo.renderArea = {{0, 0}, {gAppSettings->width, gAppSettings->height}};
         composeRenderingInfo.layerCount = 1;
         composeRenderingInfo.colorAttachmentCount = 1;
-        composeRenderingInfo.pColorAttachments = &swapchainAttachment;
+        composeRenderingInfo.pColorAttachments = &composeAttachment;
 
         vkCmdBeginRendering(cmd, &composeRenderingInfo);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, composePipeline);
@@ -3342,6 +3352,66 @@ public:
             VkBool32 colorWriteEnables[1] = {VK_TRUE};
             pfnCmdSetColorWriteEnableEXT(cmd, 1, colorWriteEnables);
         }
+
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+
+        vkCmdEndRendering(cmd);
+
+        {
+            VkImageMemoryBarrier barriers[2] = {};
+
+            barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barriers[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[0].image = composeImagePostProcessingRT->image;
+            barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barriers[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[1].image = swapchainImages[imageIndex];
+            barriers[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            barriers[1].srcAccessMask = 0;
+            barriers[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+            vkCmdPipelineBarrier(cmd,
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 0, 0, nullptr, 0, nullptr, 2, barriers);
+            composeImagePostProcessingRT->currentLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+
+        VkRenderingAttachmentInfo swapchainAttachment = {};
+        swapchainAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        swapchainAttachment.imageView = swapchainImageViews[imageIndex];
+        swapchainAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        swapchainAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        swapchainAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        swapchainAttachment.clearValue = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}}};
+
+        VkRenderingInfo fxaaRenderingInfo = {};
+        fxaaRenderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        fxaaRenderingInfo.renderArea = {{0, 0}, {gAppSettings->width, gAppSettings->height}};
+        fxaaRenderingInfo.layerCount = 1;
+        fxaaRenderingInfo.colorAttachmentCount = 1;
+        fxaaRenderingInfo.pColorAttachments = &swapchainAttachment;
+
+        vkCmdBeginRendering(cmd, &fxaaRenderingInfo);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, fxaaPipeline);
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        VkBool32 fxaaWrite = VK_TRUE;
+        pfnCmdSetColorWriteEnableEXT(cmd, 1, &fxaaWrite);
+
+        VkDescriptorSet fxaaSets[2] = {setsPersistent, setsPerFrame[frameIndex]};
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 2, fxaaSets, 0, nullptr);
 
         vkCmdDraw(cmd, 3, 1, 0, 0);
 
@@ -3528,7 +3598,29 @@ public:
             VK_CHECK(vkCreateShaderModule(device, &shaderModuleDesc, nullptr, &shaderCascadeShadowMappingFiltering->comp));
 
         } 
-     
+   
+        // Post processing shaders        
+
+        // FXAA Shaders 
+        {
+            FxaaPassShader = new Shader();
+
+            auto FXAAShaderVertCode = LoadShaderCode("shaders/fullscreen.vert.spv");
+            auto FXAAShaderFragCode = LoadShaderCode("shaders/fxaa_pass.frag.spv");
+
+            VkShaderModuleCreateInfo shaderModuleDesc = {};
+            shaderModuleDesc.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            shaderModuleDesc.pCode = reinterpret_cast<const uint32_t *>(FXAAShaderVertCode.data());
+            shaderModuleDesc.codeSize = FXAAShaderVertCode.size() * 4;
+
+            VK_CHECK(vkCreateShaderModule(device, &shaderModuleDesc, nullptr, &FxaaPassShader->vert));
+
+            shaderModuleDesc.pCode = reinterpret_cast<const uint32_t *>(FXAAShaderFragCode.data());
+            shaderModuleDesc.codeSize = FXAAShaderFragCode.size() * 4;
+            VK_CHECK(vkCreateShaderModule(device, &shaderModuleDesc, nullptr, &FxaaPassShader->frag));
+        }        
+
+
     }
     
     void addPipelines()
@@ -4178,6 +4270,109 @@ public:
             gComposePipelineDesc.layout = pipelineLayout;
             gComposePipelineDesc.flags = 0;
             VK_CHECK(vkCreateGraphicsPipelines(device, nullptr, 1, &gComposePipelineDesc, nullptr, &composePipeline));
+        }
+
+        // Post processing pipelines
+        {
+
+            // FXAA pass
+            if (FxaaPassShader)
+            {
+                VkPipelineDepthStencilStateCreateInfo depthStencilState = {};
+                depthStencilState.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+                depthStencilState.depthTestEnable = VK_FALSE;
+                depthStencilState.depthWriteEnable = VK_FALSE;
+                depthStencilState.depthCompareOp = VK_COMPARE_OP_LESS;
+                depthStencilState.depthBoundsTestEnable = VK_FALSE;
+                depthStencilState.stencilTestEnable = VK_FALSE;
+
+                VkPipelineViewportStateCreateInfo viewportState = {};
+                viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+                viewportState.viewportCount = 1;
+                viewportState.pViewports = nullptr;
+                viewportState.scissorCount = 1;
+                viewportState.pScissors = nullptr;
+
+                VkPipelineInputAssemblyStateCreateInfo inputAssemblyState = {};
+                inputAssemblyState.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+                inputAssemblyState.primitiveRestartEnable = VK_FALSE;
+                inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+                VkPipelineShaderStageCreateInfo shaderStageDesc[2] = {};
+                shaderStageDesc[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                shaderStageDesc[0].pNext = nullptr;
+                shaderStageDesc[0].flags = 0;
+                shaderStageDesc[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+                shaderStageDesc[0].module = FxaaPassShader->vert;
+                shaderStageDesc[0].pName = "main";
+                shaderStageDesc[0].pSpecializationInfo = nullptr;
+
+                shaderStageDesc[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                shaderStageDesc[1].pNext = nullptr;
+                shaderStageDesc[1].flags = 0;
+                shaderStageDesc[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+                shaderStageDesc[1].module = FxaaPassShader->frag;
+                shaderStageDesc[1].pName = "main";
+                shaderStageDesc[1].pSpecializationInfo = nullptr;
+
+                VkPipelineRenderingCreateInfo renderingInfo = {};
+                renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+                renderingInfo.colorAttachmentCount = 1;
+                renderingInfo.pColorAttachmentFormats = swapchainFormat;
+
+                VkDynamicState dynamicStates[] = {
+                    VK_DYNAMIC_STATE_VIEWPORT,
+                    VK_DYNAMIC_STATE_SCISSOR,
+                    VK_DYNAMIC_STATE_COLOR_WRITE_ENABLE_EXT,
+                };
+
+                VkPipelineDynamicStateCreateInfo dynamicState = {};
+                dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+                dynamicState.dynamicStateCount = static_cast<uint32_t>(std::size(dynamicStates));
+                dynamicState.pDynamicStates = dynamicStates;
+
+                VkPipelineVertexInputStateCreateInfo vertexInputInfo = {};
+                vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+                vertexInputInfo.vertexBindingDescriptionCount = 0;
+                vertexInputInfo.vertexAttributeDescriptionCount = 0;
+
+                VkPipelineRasterizationStateCreateInfo rasterizationState = pRasterizationState;
+                rasterizationState.cullMode = VK_CULL_MODE_NONE;
+
+                VkPipelineColorBlendAttachmentState blendAttachment = {};
+                blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+                blendAttachment.blendEnable = VK_FALSE;
+
+                VkPipelineColorBlendStateCreateInfo colorBlendState = {};
+                colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+                colorBlendState.attachmentCount = 1;
+                colorBlendState.pAttachments = &blendAttachment;
+                colorBlendState.logicOpEnable = VK_FALSE;
+
+                VkGraphicsPipelineCreateInfo fxaaPipelineDesc = {};
+                fxaaPipelineDesc.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+                fxaaPipelineDesc.pNext = &renderingInfo;
+                fxaaPipelineDesc.stageCount = 2;
+                fxaaPipelineDesc.pStages = shaderStageDesc;
+                fxaaPipelineDesc.pVertexInputState = &vertexInputInfo;
+                fxaaPipelineDesc.pInputAssemblyState = &inputAssemblyState;
+                fxaaPipelineDesc.pTessellationState = nullptr;
+                fxaaPipelineDesc.pViewportState = &viewportState;
+                fxaaPipelineDesc.pRasterizationState = &rasterizationState;
+                fxaaPipelineDesc.pMultisampleState = &multisampleState;
+                fxaaPipelineDesc.pDepthStencilState = &depthStencilState;
+                fxaaPipelineDesc.pColorBlendState = &colorBlendState;
+                fxaaPipelineDesc.pDynamicState = &dynamicState;
+                fxaaPipelineDesc.layout = pipelineLayout;
+                fxaaPipelineDesc.renderPass = VK_NULL_HANDLE;
+                fxaaPipelineDesc.subpass = 0;
+                fxaaPipelineDesc.flags = 0;
+
+                VK_CHECK(vkCreateGraphicsPipelines(device, nullptr, 1, &fxaaPipelineDesc, nullptr, &fxaaPipeline));
+
+            }
+
         }
     }
    
