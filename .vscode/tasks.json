@@ -1,0 +1,24 @@
+{
+    "tasks": [
+        {
+            "type": "process",
+            "label": "Build Renderer",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build",
+                "--target",
+                "vkml",
+                "-j",
+                "4"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": "$gcc",
+            "group": "build",
+            "detail": "Builds the renderer and its shaders through CMake."
+        }
+    ],
+    "version": "2.0.0"
+}
